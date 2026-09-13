@@ -6,6 +6,7 @@ import { extractStreams } from '../../extractors/index.js';
 import { isCaptchaChallenge } from '../../utils/captcha.js';
 import { globalCache } from '../../utils/cache.js';
 import { getOrSolveClearance, isSolverDegraded } from '../../utils/cloudflareSolver.js';
+import { solveChallenge, isFlareSolverrConfigured } from '../../utils/flareSolverrClient.js';
 
 interface MtdbVideo {
   id: number;
@@ -56,7 +57,7 @@ export class EgydeadProvider extends BaseProvider {
   lang = 'ar';
   mainUrl = 'https://egydead.ca';
   supportedTypes: StremioContentType[] = ['movie', 'series'];
-  requiresBrowserSolver: boolean = false;
+  requiresBrowserSolver: boolean = true;
 
   // Mirror domains tracked for fallback
   mirrors: string[] = [
@@ -246,34 +247,73 @@ export class EgydeadProvider extends BaseProvider {
             return resp;
           }
 
-          // Try solving the Cloudflare challenge with a headless browser ONLY if this provider
-          // explicitly declared a browser solver dependency (requiresBrowserSolver: true).
-          // Egydead operates on the MTDb REST API on egydead.ca without Turnstile, so requiresBrowserSolver
-          // is false; this prevents silent fall-through to CloudflareSolver and avoids tripping circuit
-          // breakers on environments lacking Chromium (e.g. Render native Node).
+          // Cloudflare challenge detected. If this provider declared requiresBrowserSolver: true and cooldown is not active,
+          // attempt to solve the challenge before tripping the circuit breaker.
           if (this.requiresBrowserSolver && attempt === 1 && !this.isCooldownActive()) {
-            const clearance = await getOrSolveClearance(fullUrl, this.id);
-            if (clearance) {
+            if (isFlareSolverrConfigured()) {
               try {
-                const retryHeaders = {
+                this.logger.info(
+                  `[Egydead] Cloudflare challenge encountered for ${cleanMirror} (${pathAndQuery}); invoking FlareSolverr sidecar...`
+                );
+                const solution = await solveChallenge(fullUrl);
+
+                // Apply returned clearance cookies to the domain's session in HttpClient cookie jar
+                const domain = new URL(fullUrl).hostname;
+                for (const c of solution.cookies) {
+                  http.setCookie(c.name, c.value, c.domain || domain);
+                }
+
+                // Retry original request using the EXACT matching User-Agent FlareSolverr used (UA-bound cookies)
+                const retryHeaders: Record<string, string> = {
                   ...headers,
-                  Cookie: clearance.cookie,
-                  'User-Agent': clearance.userAgent,
+                  'User-Agent': solution.userAgent,
                 };
+                if (solution.cookies.length > 0) {
+                  retryHeaders['Cookie'] = solution.cookies.map((c) => `${c.name}=${c.value}`).join('; ');
+                }
+
                 const retryResp = await http.get(fullUrl, { headers: retryHeaders, timeout });
                 if (!isCaptchaChallenge(retryResp.text, retryResp.status)) {
                   this.recordMirrorSuccess(cleanMirror);
                   this.mainUrl = cleanMirror;
                   this.recordSuccess();
                   this.logger.info(
-                    `[Egydead] Cloudflare challenge solved via headless browser for ${cleanMirror}; request succeeded.`
+                    `[Egydead] Cloudflare challenge successfully solved via FlareSolverr for ${cleanMirror}; request succeeded.`
                   );
                   return retryResp;
                 }
                 lastResp = retryResp;
-              } catch (solveRetryErr) {
+              } catch (flareErr) {
+                this.logger.warn(
+                  `[Egydead] FlareSolverr challenge solve failed for ${cleanMirror}: ${(flareErr as Error).message}`
+                );
+                // Fall through to existing per-provider retry and circuit-breaker behavior
+              }
+            } else {
+              // Local Playwright solver fallback (when FLARESOLVERR_URL is unset, e.g. local dev with Chromium)
+              try {
+                const clearance = await getOrSolveClearance(fullUrl, this.id);
+                if (clearance) {
+                  const retryHeaders = {
+                    ...headers,
+                    Cookie: clearance.cookie,
+                    'User-Agent': clearance.userAgent,
+                  };
+                  const retryResp = await http.get(fullUrl, { headers: retryHeaders, timeout });
+                  if (!isCaptchaChallenge(retryResp.text, retryResp.status)) {
+                    this.recordMirrorSuccess(cleanMirror);
+                    this.mainUrl = cleanMirror;
+                    this.recordSuccess();
+                    this.logger.info(
+                      `[Egydead] Cloudflare challenge solved via local Playwright for ${cleanMirror}; request succeeded.`
+                    );
+                    return retryResp;
+                  }
+                  lastResp = retryResp;
+                }
+              } catch (localSolveErr) {
                 this.logger.debug(
-                  `[Egydead] Clearance retry failed for ${cleanMirror}: ${(solveRetryErr as Error).message}`
+                  `[Egydead] Local Playwright clearance retry failed for ${cleanMirror}: ${(localSolveErr as Error).message}`
                 );
               }
             }
@@ -443,7 +483,7 @@ export class EgydeadProvider extends BaseProvider {
         return [];
       }
 
-      if (resp.status === 200 && resp.text.startsWith('{')) {
+      if (resp.status === 200 && resp.text && resp.text.trim().startsWith('{')) {
         const data = JSON.parse(resp.text);
         const list: MtdbTitle[] = data.channel?.content?.data || data.channel?.content || [];
 
@@ -490,7 +530,10 @@ export class EgydeadProvider extends BaseProvider {
       // Cheerio HTML Fallback for legacy mirrors
       return this.catalogHtmlFallback(resp, isSeries);
     } catch (e) {
-      this.logger.debug(`Egydead getCatalog error: ${(e as Error).message}`);
+      const err = e as Error;
+      this.logger.warn(
+        `Egydead getCatalog error: ${err.name} - ${err.message}${err.stack ? `\n${err.stack}` : ''}`
+      );
       return [];
     }
   }

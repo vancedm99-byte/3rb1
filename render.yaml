@@ -1,0 +1,35 @@
+services:
+  # FlareSolverr Sidecar Private Service (isolated Docker image for Cloudflare challenge solving)
+  - type: pserv
+    name: flaresolverr
+    runtime: image
+    image:
+      url: ghcr.io/flaresolverr/flaresolverr:latest
+    envVars:
+      - key: LOG_LEVEL
+        value: info
+      - key: PORT
+        value: "8191"
+      - key: TZ
+        value: UTC
+
+  # Main Stremio Addon Web Service (native Node runtime)
+  - type: web
+    name: threerb-1
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: 22.23.2
+      - key: FLARESOLVERR_URL
+        fromService:
+          type: pserv
+          name: flaresolverr
+          property: hostport
+      - key: FLARESOLVERR_HOST
+        fromService:
+          type: pserv
+          name: flaresolverr
+          property: host

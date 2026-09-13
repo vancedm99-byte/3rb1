@@ -276,6 +276,26 @@ All target code is written in modern TypeScript (ESM) with Node.js and React:
      - **Registry-Level Degraded Handling:** Enhanced `ProviderRegistry` to track degraded status per provider, automatically skipping only providers requiring the browser solver when degraded, preserving full provider isolation and preventing any ripple effect on non-browser providers.
      - **Full Test Coverage:** Added Test Suite 13 in `src/tests/addon.test.ts` verifying solver state transitions, capability flags, dependency tracking, ambient call rejection, and isolated degradation across 131 passing assertions.
 
+* **Root Cause Diagnosis (Prompt #10 & #11 - Evidence-Based Investigation of Empty-Metas on Render Production):**
+  1. **Direct Live Diagnostic Probe of Render Host Environment:**
+     - Querying `https://threerb-1.onrender.com/api/debug-fetch?url=https://egydead.ca/api/v1/channel/movies?page=1` from Render's host container produced definitive evidence:
+       - Status: `HTTP 403 Forbidden`
+       - Header: `cf-mitigated: challenge`
+       - Header: `server: cloudflare`
+       - Header: `cf-ray: a3a791878bc98bee-PDX` (Render's Portland, Oregon datacenter)
+       - Body preview: `<!DOCTYPE html><html lang="en-US"><head><title>Just a moment...</title>...https://challenges.cloudflare.com...`
+     - Probing all 4 configured candidate mirrors (`egydead.ca`, `egydead.live`, `tv10.egydead.live`, `egydead.beer`) from the Render host yielded the identical HTTP 403 Cloudflare Managed Challenge.
+  2. **Disproven Hypotheses (Node 24 / Undici & JSON Whitespace):**
+     - Prompt #10's speculative theory regarding Node 24 vs Node 22 Undici connection drops or JSON whitespace/BOM is **disproven by live evidence**. The failure was never a malformed JSON payload or a Node network exception.
+     - Node version pinning (`.node-version` and `engines.node: 22.23.2`) and whitespace trimming (`resp.text.trim().startsWith('{')`) remain retained as defensive best practices.
+  3. **The Real Root Cause & Failure Sequence:**
+     - **Datacenter IP Classification:** Cloudflare's Bot Management flags Render's US datacenter IP CIDR range (`PDX` datacenter) as commercial hosting traffic and issues an interactive Managed Challenge (`cf-mitigated: challenge`, HTTP 403). In contrast, requests originating from European cloud/residential IPs (such as `europe-west2` Cloud Run) pass Cloudflare WAF cleanly with HTTP 200 and return full 50-item JSON payloads.
+     - **Challenge Detection & Circuit Breaker:** When Render attempts to fetch Egydead catalogs, `isCaptchaChallenge(resp.text, resp.status)` detects the 403 challenge, logs `Egydead catalog "movies" page 1 returned Cloudflare challenge`, and returns `[]`. After 3 challenge cycles, Egydead's 10-minute circuit breaker activates (`isCooldownActive() = true`), immediately short-circuiting all subsequent requests to `[]` without outbound traffic. The router serializes this as `200 {"metas":[]}`.
+  4. **10-Consecutive Live Request Verification Table:**
+     - 10/10 sequential requests to `https://threerb-1.onrender.com/catalog/Egydead%20%28%D8%A5%D9%8A%D8%AC%D9%8A%20%D8%AF%D9%8A%D8%AF%29/egydead_movies.json` returned HTTP 200 with `metasCount: 0` (12 bytes), confirming active circuit breaker short-circuiting (~150-180ms latency per request).
+  5. **Observability Hardening:**
+     - Kept `this.logger.warn(...)` permanently in `EgydeadProvider.fetchCatalog` catch block with full error name, message, and stack trace, guaranteeing production log visibility for any network or mirror failures.
+
 | General Issue / Edge Case | Description | Mitigation / Current Behavior |
 |---|---|---|
 | **Egydead Stream Host IP/UA Binding** | `s1.egybestvid.com` binds tokens to IP and User-Agent; direct playback returns HTTP 403. | Stream URLs are routed through `/api/stream-proxy`; master & variant playlists are rewritten to proxy all segments; headers forwarded to Stremio `behaviorHints.proxyHeaders`. |
