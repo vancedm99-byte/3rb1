@@ -30,6 +30,12 @@ export const DEFAULT_USER_AGENT =
 export const MOBILE_USER_AGENT =
   'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36';
 
+export const BROWSER_HEADERS: Record<string, string> = {
+  'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+  'sec-ch-ua-mobile': '?0',
+  'sec-ch-ua-platform': '"Windows"',
+};
+
 export class HttpClient {
   private defaultHeaders: Record<string, string>;
   private cookieJar: Map<string, string> = new Map();
@@ -114,15 +120,22 @@ export class HttpClient {
         responseHeaders[key.toLowerCase()] = val;
       });
 
-      // Track set-cookie
-      const setCookie = resp.headers.get('set-cookie');
-      if (setCookie) {
-        const matches = setCookie.matchAll(/([^=;]+)=([^;]+)/g);
-        for (const match of matches) {
-          const k = match[1]?.trim();
-          const v = match[2]?.trim();
-          if (k && v && !['path', 'expires', 'domain', 'samesite', 'secure', 'httponly'].includes(k.toLowerCase())) {
-            this.cookieJar.set(k, v);
+      // Track set-cookie (supporting both multi-cookie getSetCookie and standard fallback)
+      const setCookies: string[] = typeof (resp.headers as any).getSetCookie === 'function'
+        ? (resp.headers as any).getSetCookie()
+        : (resp.headers.get('set-cookie') ? [resp.headers.get('set-cookie')!] : []);
+
+      for (const cookieStr of setCookies) {
+        const parts = cookieStr.split(';');
+        const first = parts[0]?.trim();
+        if (first) {
+          const eqIdx = first.indexOf('=');
+          if (eqIdx > 0) {
+            const k = first.substring(0, eqIdx).trim();
+            const v = first.substring(eqIdx + 1).trim();
+            if (k && v && !['path', 'expires', 'domain', 'samesite', 'secure', 'httponly'].includes(k.toLowerCase())) {
+              this.cookieJar.set(k, v);
+            }
           }
         }
       }

@@ -316,6 +316,53 @@ export async function runTests() {
         assert(s.url.includes('/api/stream-proxy'), 'Egydead episode stream URL is routed through /api/stream-proxy');
         assert(!!s.headers && !!s.headers.Referer, 'Egydead episode stream contains Referer header');
       }
+
+      // 7. Test Suite 11: Cloudflare Challenge Mitigation & Circuit Breaker Cooldown
+      console.log('\n[Test Suite 11: Egydead Cloudflare Challenge Mitigation & Circuit Breaker Cooldown]');
+      const egyAny = egydead as any;
+
+      // Ensure clean initial state
+      egyAny.resetCooldown();
+      assert(egyAny.isDegraded() === false, 'Egydead initially not in degraded/cooldown state');
+      assert(egyAny.getCooldownRemainingMs() === 0, 'Initial cooldown remaining ms is 0');
+
+      // Simulate consecutive Cloudflare challenges
+      console.log('  -> Simulating consecutive Cloudflare challenge failures...');
+      egyAny.recordChallengeFailure();
+      assert(egyAny.isDegraded() === false, '1 challenge does not trigger circuit breaker cooldown');
+
+      egyAny.recordChallengeFailure();
+      assert(egyAny.isDegraded() === false, '2 challenges do not trigger circuit breaker cooldown');
+
+      egyAny.recordChallengeFailure(); // 3rd challenge triggers threshold
+      assert(egyAny.isDegraded() === true, '3 consecutive challenges trigger circuit breaker cooldown (isDegraded = true)');
+      assert(egyAny.getCooldownRemainingMs() > 0, 'Cooldown timer active (> 0ms remaining)');
+
+      // Verify graceful degradation during active cooldown
+      console.log('  -> Verifying graceful degradation while in cooldown...');
+      const cooldownCatalog = await egydead.getCatalog('movies', 99);
+      assert(Array.isArray(cooldownCatalog), 'Catalog returns valid array during cooldown without throwing');
+
+      const cooldownSearch = await egydead.search('test-query-during-cooldown');
+      assert(Array.isArray(cooldownSearch), 'Search returns valid array during cooldown without network call or crash');
+
+      const cooldownStreams = await egydead.getStreams('99999', 'movie');
+      assert(Array.isArray(cooldownStreams) && cooldownStreams.length === 0, 'Stream resolution returns empty array during cooldown');
+
+      // Verify Provider Isolation: Other providers must function unimpeded while Egydead is in cooldown
+      console.log('  -> Verifying provider isolation during Egydead cooldown...');
+      const akwam = registry.getProvider('akwam');
+      assert(!!akwam, 'Akwam provider available for isolation check');
+      if (akwam) {
+        const akwamCatalog = await akwam.getCatalog('movies', 1);
+        assert(akwamCatalog.length > 0, `Akwam catalog resolves successfully (${akwamCatalog.length} items) while Egydead is degraded`);
+      }
+
+      // Verify recovery / reset
+      console.log('  -> Verifying cooldown reset / healthy recovery...');
+      egyAny.recordSuccess();
+      assert(egyAny.isDegraded() === false, 'Successful probe resets degraded status back to false');
+      assert(egyAny.getCooldownRemainingMs() === 0, 'Cooldown timer reset to 0');
     } catch (err) {
       assert(false, `Egydead test suite encountered error: ${(err as Error).message}`);
     }
