@@ -23,6 +23,19 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 ENV PORT=3000
+ENV CHROMIUM_PATH=/usr/bin/chromium-browser
+
+# System Chromium for the Egydead Cloudflare challenge solver.
+# Playwright's own downloaded browser is a glibc build and will NOT run on
+# Alpine (musl) — so we install Chromium via apk instead and point
+# playwright-core at it via CHROMIUM_PATH (see src/utils/cloudflareSolver.ts).
+RUN apk add --no-cache \
+    chromium \
+    nss \
+    freetype \
+    harfbuzz \
+    ca-certificates \
+    ttf-freefont
 
 # Copy production artifacts
 COPY package*.json ./

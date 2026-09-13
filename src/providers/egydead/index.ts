@@ -5,6 +5,7 @@ import { http, HttpResponse, DEFAULT_USER_AGENT, MOBILE_USER_AGENT } from '../..
 import { extractStreams } from '../../extractors/index.js';
 import { isCaptchaChallenge } from '../../utils/captcha.js';
 import { globalCache } from '../../utils/cache.js';
+import { getOrSolveClearance } from '../../utils/cloudflareSolver.js';
 
 interface MtdbVideo {
   id: number;
@@ -239,6 +240,39 @@ export class EgydeadProvider extends BaseProvider {
               `[Egydead] Request to ${pathAndQuery} successfully served by mirror ${cleanMirror}`
             );
             return resp;
+          }
+
+          // Try solving the Cloudflare challenge with a headless browser
+          // once per mirror (first attempt only) before falling back to the
+          // normal backoff-retry / mirror-rotation path. Skipped entirely
+          // while already in cooldown so we never launch Chromium during a
+          // known-bad window.
+          if (attempt === 1 && !this.isCooldownActive()) {
+            const clearance = await getOrSolveClearance(fullUrl);
+            if (clearance) {
+              try {
+                const retryHeaders = {
+                  ...headers,
+                  Cookie: clearance.cookie,
+                  'User-Agent': clearance.userAgent,
+                };
+                const retryResp = await http.get(fullUrl, { headers: retryHeaders, timeout });
+                if (!isCaptchaChallenge(retryResp.text, retryResp.status)) {
+                  this.recordMirrorSuccess(cleanMirror);
+                  this.mainUrl = cleanMirror;
+                  this.recordSuccess();
+                  this.logger.info(
+                    `[Egydead] Cloudflare challenge solved via headless browser for ${cleanMirror}; request succeeded.`
+                  );
+                  return retryResp;
+                }
+                lastResp = retryResp;
+              } catch (solveRetryErr) {
+                this.logger.debug(
+                  `[Egydead] Clearance retry failed for ${cleanMirror}: ${(solveRetryErr as Error).message}`
+                );
+              }
+            }
           }
 
           if (attempt <= maxRetries) {
