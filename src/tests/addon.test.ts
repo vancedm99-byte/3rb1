@@ -1,0 +1,326 @@
+import { manifest } from '../addon/manifest.js';
+import { registry } from '../providers/index.js';
+import { unpackPacker, unpackAll } from '../utils/packer.js';
+import { decryptYacine, decryptWitAnimeEpisodeData, safeBase64Decode } from '../utils/crypto.js';
+import { MemoryCache } from '../utils/cache.js';
+import { extractMiraVd, extractMwdy, extractVidoba, extractUkrcdn } from '../extractors/index.js';
+import { http } from '../utils/http.js';
+
+export async function runTests() {
+  console.log('--- STARTING STREMIO ADDON TESTS ---');
+  let passed = 0;
+  let failed = 0;
+
+  function assert(condition: boolean, desc: string) {
+    if (condition) {
+      console.log(`  ✓ PASS: ${desc}`);
+      passed++;
+    } else {
+      console.error(`  ✗ FAIL: ${desc}`);
+      failed++;
+    }
+  }
+
+  // 1. Manifest Validation
+  console.log('\n[Test Suite 1: Manifest Validation]');
+  assert(manifest.id === 'community.re3arabi.addon', 'Manifest ID is correct');
+  assert(manifest.name.includes('Re-3arabi'), 'Manifest Name contains Re-3arabi');
+  assert(manifest.resources.includes('catalog') && manifest.resources.includes('stream'), 'Resources include catalog & stream');
+  assert(manifest.types.includes('movie') && manifest.types.includes('series') && manifest.types.includes('tv'), 'Types include movie, series, tv');
+  assert((manifest.catalogs || []).length >= 10, 'Has catalogs for all registered providers');
+  assert((manifest.idPrefixes || []).length === 10, 'All 10 provider ID prefixes registered in manifest');
+
+  // Verify per-provider types and genre extra options
+  const akwamCatalog = (manifest.catalogs || []).find((c) => c.type.includes('Akwam'));
+  assert(!!akwamCatalog, 'Manifest exposes Akwam as a distinct type');
+  const akwamGenre = akwamCatalog?.extra?.find((e) => e.name === 'genre');
+  assert(!!akwamGenre && (akwamGenre.options || []).length > 0, 'Akwam catalog includes genre dropdown options');
+
+  const yacineCatalog = (manifest.catalogs || []).find((c) => c.type.includes('Yacine'));
+  assert(!!yacineCatalog, 'Manifest exposes Yacine TV as a distinct type with live catalogs');
+
+  // Verify all providers have getCatalogs implemented
+  const allProviders = registry.getAllProviders();
+  const allHaveCatalogs = allProviders.every((p) => typeof p.getCatalogs === 'function' && p.getCatalogs().length > 0);
+  assert(allHaveCatalogs, 'Every registered provider implements getCatalogs() with at least 1 catalog');
+
+  // 2. Provider Registry
+  console.log('\n[Test Suite 2: Provider Registry]');
+  const providers = registry.getAllProviders();
+  assert(providers.length === 10, `Loaded all 10 target providers (found ${providers.length})`);
+
+  const expectedIds = ['akwam', 'faselhd', 'arabseed', 'wecima', 'anime4up', 'syrialive', 'yacinetv', 'witanime', '3isk', 'egydead'];
+  for (const id of expectedIds) {
+    const p = registry.getProvider(id);
+    assert(!!p, `Provider "${id}" is properly instantiated and registered`);
+  }
+
+  // 3. ID Parsing & Namespacing Round-Trip
+  console.log('\n[Test Suite 3: ID Parsing & Namespacing]');
+  const testId1 = 'akwam:series/12345';
+  const parsed1 = registry.parseProviderAndId(testId1);
+  assert(parsed1.provider?.id === 'akwam' && parsed1.contentId === 'series/12345', 'Namespaced ID parses correctly');
+
+  const testId2 = 'yacinetv:channel/42';
+  const parsed2 = registry.parseProviderAndId(testId2);
+  assert(parsed2.provider?.id === 'yacinetv' && parsed2.contentId === 'channel/42', 'Live TV ID parses correctly');
+
+  // 4. Crypto & Deobfuscation Algorithms
+  console.log('\n[Test Suite 4: Deobfuscation & Decryption Algorithms]');
+  // Base64 safe decoding
+  const b64Input = 'aHR0cHM6Ly9leGFtcGxlLmNvbS9zdHJlYW0ubTN1OA';
+  const decodedB64 = safeBase64Decode(b64Input);
+  assert(decodedB64 === 'https://example.com/stream.m3u8', 'Base64 decodes URL correctly');
+
+  // YacineTV XOR Decryption Test
+  // Generate a test XOR payload with baseKey "c!xZj+N9&G@Ev@vw" + t "12345"
+  const tHeader = '12345';
+  const key = 'c!xZj+N9&G@Ev@vw12345';
+  const plainText = JSON.stringify({ status: 200, data: [{ id: 1, name: 'beIN Sports 1' }] });
+  const cipherBuf = Buffer.alloc(plainText.length);
+  for (let i = 0; i < plainText.length; i++) {
+    cipherBuf[i] = plainText.charCodeAt(i) ^ key.charCodeAt(i % key.length);
+  }
+  const encryptedBase64 = cipherBuf.toString('base64');
+  const decryptedYacine = decryptYacine(encryptedBase64, tHeader);
+  assert(decryptedYacine === plainText, 'YacineTV XOR cipher decrypts accurately');
+
+  // WitAnime XOR Test
+  const part1 = Buffer.from('hello_witanime_stream');
+  const part2 = Buffer.from('secret_xor_key');
+  const xored = Buffer.alloc(part1.length);
+  for (let i = 0; i < part1.length; i++) {
+    xored[i] = part1[i] ^ part2[i % part2.length];
+  }
+  const encodedWit = `${xored.toString('base64')}.${part2.toString('base64')}`;
+  const decryptedWit = decryptWitAnimeEpisodeData(encodedWit);
+  assert(decryptedWit === 'hello_witanime_stream', 'WitAnime dual-buffer XOR decryption works');
+
+  // Dean Edwards Unpacker Test
+  const packedScript = `eval(function(p,a,c,k,e,d){while(c--)if(k[c])p=p.replace(new RegExp('\\\\b'+c.toString(a)+'\\\\b','g'),k[c]);return p}('1 0="2";',3,3,'stream|var|https'.split('|')))`;
+  const unpacked = unpackPacker(packedScript);
+  assert(!!unpacked && unpacked.includes('var stream="https"'), 'Dean Edwards unpacker resolves successfully');
+
+  // 5. Cache Module
+  console.log('\n[Test Suite 5: In-Memory TTL Cache]');
+  const cache = new MemoryCache(10);
+  cache.set('key1', 'test_value', 10);
+  assert(cache.get('key1') === 'test_value', 'Cache returns saved value');
+  cache.delete('key1');
+  assert(cache.get('key1') === null, 'Cache correctly deletes value');
+
+  // 6. Provider Isolation
+  console.log('\n[Test Suite 6: Provider Isolation & Graceful Fallback]');
+  const invalidResult = await registry.getMeta('nonexistent:123', 'movie');
+  assert(invalidResult === null, 'Non-existent provider gracefully returns null without crashing');
+
+  // 7. 3isk Stream Resolution (Target Prompt #3 regression test)
+  console.log('\n[Test Suite 7: 3isk Stream Resolution & 2-Stage Handshake]');
+  const threeIsk = registry.getProvider('3isk');
+  assert(!!threeIsk, '3isk provider is registered in registry');
+
+  if (threeIsk) {
+    try {
+      // Test movie stream resolution
+      console.log('  -> Resolving 3isk movie streams...');
+      const movieStreams = await threeIsk.getStreams('/watch/movies/movie-sultana-2026/', 'movie');
+      assert(movieStreams.length > 0, `3isk movie stream resolution returns playable streams (found ${movieStreams.length})`);
+      if (movieStreams.length > 0) {
+        const s = movieStreams[0];
+        assert(s.url.startsWith('http') && (s.url.includes('.m3u8') || s.url.includes('.mp4')), '3isk movie stream URL is valid m3u8/mp4');
+        assert(!!s.headers && !!s.headers.Referer, '3isk movie stream contains necessary Referer headers');
+      }
+
+      // Test series episode stream resolution
+      console.log('  -> Resolving 3isk episode streams...');
+      const epStreams = await threeIsk.getStreams('/watch/episodes/serie-yasamayanlar-muddblij-season-1-ep-8-m453p/', 'series');
+      assert(epStreams.length > 0, `3isk episode stream resolution returns unpacked streams (found ${epStreams.length})`);
+      if (epStreams.length > 0) {
+        const s = epStreams[0];
+        assert(s.url.startsWith('http') && (s.url.includes('.m3u8') || s.url.includes('.mp4')), '3isk episode stream URL is valid unpacked m3u8/mp4');
+        assert(s.isM3u8 === true, '3isk unpacked episode stream identified as HLS (isM3u8=true)');
+      }
+
+      // Test previously failed "no-token" title recovered via multi-server fallback
+      console.log('  -> Resolving 3isk recovered title (movie-cahim-2025)...');
+      const cahimStreams = await threeIsk.getStreams('/watch/movies/movie-cahim-2025/', 'movie');
+      assert(Array.isArray(cahimStreams) && cahimStreams.length > 0, `3isk multi-server recovery resolves streams for movie-cahim-2025 (found ${cahimStreams.length})`);
+
+      // Test graceful handling of genuinely unavailable upstream title (404)
+      console.log('  -> Resolving 3isk genuinely unavailable title (movie-leila-2026)...');
+      const unavailableStreams = await threeIsk.getStreams('/watch/movies/movie-leila-2026/', 'movie');
+      assert(Array.isArray(unavailableStreams) && unavailableStreams.length === 0, 'Unavailable upstream video returns empty array gracefully without crashing');
+    } catch (err) {
+      assert(false, `3isk stream resolution threw error: ${(err as Error).message}`);
+    }
+  }
+
+  // 8. 3isk Dedicated Host Extractors (Target Prompt #4)
+  console.log('\n[Test Suite 8: Dedicated Host Extractors & Unpacker Variants]');
+  
+  // Unpacker parameter variation test (p, a, c, k, e, r with spaces)
+  const variantPacked = `eval( function( p , a , c , k , e , r ){ while( c-- ) if( k[c] ) p=p.replace( new RegExp( '\\\\b'+c.toString(a)+'\\\\b' , 'g' ) , k[c] ); return p; } ('1 0="2";', 3, 3, 'player|const|https'.split('|') ) )`;
+  const unpackedVariant = unpackPacker(variantPacked);
+  assert(!!unpackedVariant && unpackedVariant.includes('const player="https"'), 'Unpacker handles parameter variants (p, a, c, k, e, r with whitespace)');
+
+  // Multiple packed scripts in single HTML document test
+  const multiScriptHtml = `
+    <html>
+      <script>eval(function(p,a,c,k,e,d){return p}('var a="first";',1,1,'first'.split('|')))</script>
+      <script>eval(function(p,a,c,k,e,d){return p}('var b="second";',1,1,'second'.split('|')))</script>
+    </html>
+  `;
+  const multiUnpacked = unpackAll(multiScriptHtml);
+  assert(multiUnpacked.includes('var a="first"') && multiUnpacked.includes('var b="second"'), 'unpackAll resolves multiple packed blocks in a single document');
+
+  // MiraVd extractor test
+  try {
+    const miravdStreams = await extractMiraVd('https://miravd.com/embed-4fk32azs012x.html', 'https://3iskk.xyz/');
+    assert(miravdStreams.length > 0, `MiraVd extractor resolves streams (found ${miravdStreams.length})`);
+    if (miravdStreams.length > 0) {
+      assert(miravdStreams[0].isM3u8 === true, 'MiraVd stream recognized as HLS');
+    }
+  } catch (err) {
+    assert(false, `MiraVd extractor threw error: ${(err as Error).message}`);
+  }
+
+  // Mwdy extractor test
+  try {
+    const mwdyStreams = await extractMwdy('https://mwdy.cc/embed-xr59gzgusfk9.html', 'https://3iskk.xyz/');
+    assert(mwdyStreams.length > 0, `Mwdy extractor resolves streams (found ${mwdyStreams.length})`);
+    if (mwdyStreams.length > 0) {
+      assert(mwdyStreams[0].isM3u8 === true, 'Mwdy stream recognized as HLS');
+    }
+  } catch (err) {
+    assert(false, `Mwdy extractor threw error: ${(err as Error).message}`);
+  }
+
+  // Vidoba extractor test
+  try {
+    const vidobaStreams = await extractVidoba('https://vidoba.org/embed-yrbohb2qbfic.html', 'https://3iskk.xyz/');
+    assert(vidobaStreams.length > 0, `Vidoba extractor resolves streams (found ${vidobaStreams.length})`);
+    if (vidobaStreams.length > 0) {
+      assert(vidobaStreams[0].isM3u8 === true, 'Vidoba stream recognized as HLS');
+    }
+  } catch (err) {
+    assert(false, `Vidoba extractor threw error: ${(err as Error).message}`);
+  }
+
+  // 9. Captcha Detection & Fallback Isolation (Target Prompt #5)
+  console.log('\n[Test Suite 9: Captcha Isolation & Multi-Server Retry]');
+  const { isCaptchaChallenge } = await import('../utils/captcha.js');
+  assert(isCaptchaChallenge('<html><head><title>Just a moment...</title></head></html>', 403) === true, 'isCaptchaChallenge detects 403 Cloudflare challenge');
+  assert(isCaptchaChallenge('<html><body><div class="cf-turnstile"></div></body></html>') === true, 'isCaptchaChallenge detects Cloudflare turnstile');
+  assert(isCaptchaChallenge('<html><body><iframe src="https://mwdy.cc/embed-123.html"></iframe></body></html>') === false, 'isCaptchaChallenge does not flag normal player pages');
+
+  // Simulated partial host failure (one captcha host does not block title)
+  if (threeIsk) {
+    const origGet = http.get.bind(http);
+    let captchaHit: boolean = false;
+    http.get = async (url: string, opts?: any) => {
+      // Intercept Server 1 embed specifically to simulate captcha gate
+      if (url.includes('/embed/1/')) {
+        captchaHit = true;
+        return {
+          status: 403,
+          statusText: 'Forbidden',
+          headers: {},
+          text: '<html><head><title>Just a moment...</title></head><body><div class="cf-turnstile"></div></body></html>',
+          $: {} as any,
+          json: () => ({}),
+        };
+      }
+      return origGet(url, opts);
+    };
+
+    try {
+      console.log('  -> Testing partial host failure isolation with simulated captcha on Server 1...');
+      const fallbackStreams = await (threeIsk as any).getStreamsInternal('/watch/movies/movie-cahim-2025/', 'movie');
+      assert(Boolean(captchaHit), 'Simulated captcha on Server 1 was triggered');
+      assert(fallbackStreams.length > 0, `Streams resolved from alternate mirrors despite Server 1 captcha (found ${fallbackStreams.length})`);
+    } catch (err) {
+      assert(false, `Captcha isolation test threw error: ${(err as Error).message}`);
+    } finally {
+      http.get = origGet;
+    }
+  }
+
+  // 10. Egydead Provider (Target Prompt #6)
+  console.log('\n[Test Suite 10: Egydead Provider End-to-End Pipeline]');
+  const egydead = registry.getProvider('egydead');
+  assert(!!egydead, 'Egydead provider is registered in registry');
+
+  if (egydead) {
+    try {
+      // 1. Test Catalog
+      console.log('  -> Testing Egydead catalog (movies)...');
+      const egyCatalog = await egydead.getCatalog('movies', 1);
+      assert(egyCatalog.length > 0, `Egydead catalog returns items (found ${egyCatalog.length})`);
+      if (egyCatalog.length > 0) {
+        assert(egyCatalog[0].id.startsWith('egydead:'), 'Catalog item ID is properly namespaced with "egydead:"');
+        assert(!!egyCatalog[0].title, 'Catalog item has a title');
+      }
+
+      // 2. Test Search
+      console.log('  -> Testing Egydead search ("batman")...');
+      const egySearch = await egydead.search('batman');
+      assert(egySearch.length > 0, `Egydead search returns results (found ${egySearch.length})`);
+
+      // 3. Test Movie Meta
+      console.log('  -> Testing Egydead movie metadata (5437)...');
+      const movieMeta = await egydead.getMeta('5437', 'movie');
+      assert(!!movieMeta && !!movieMeta.title, 'Egydead movie meta successfully fetched');
+
+      // 4. Test Series Meta
+      console.log('  -> Testing Egydead series metadata (5407)...');
+      const seriesMeta = await egydead.getMeta('5407', 'series');
+      assert(!!seriesMeta && Array.isArray(seriesMeta.episodes) && seriesMeta.episodes.length > 0, `Egydead series meta contains episodes (found ${seriesMeta?.episodes?.length || 0})`);
+
+      // 5. Test Movie Stream (Target Prompt #7 regression tests: stream-proxy routing & headers)
+      console.log('  -> Testing Egydead movie stream resolution (5437)...');
+      const movieStreams = await egydead.getStreams('5437', 'movie');
+      assert(movieStreams.length > 0, `Egydead movie stream resolution returns playable streams (found ${movieStreams.length})`);
+      if (movieStreams.length > 0) {
+        const s = movieStreams[0];
+        // Must route through /api/stream-proxy to protect against IP/UA binding and CORS blocks
+        assert(s.url.includes('/api/stream-proxy'), 'Egydead stream URL is routed through /api/stream-proxy');
+        assert(s.url.includes('url=') && s.url.includes('referer=') && s.url.includes('userAgent='), 'Egydead stream proxy URL contains encoded target URL, referer, and userAgent');
+        assert(s.isM3u8 === true, 'Egydead movie stream recognized as HLS');
+        assert(!!s.headers && !!s.headers.Referer && !!s.headers['User-Agent'], 'Egydead stream contains necessary Referer and User-Agent headers for behaviorHints.proxyHeaders');
+
+        // Test proxy resolution of upstream m3u8 playlist
+        const proxyUrlParsed = new URL(s.url, 'http://localhost:3000');
+        const upstreamTarget = proxyUrlParsed.searchParams.get('url');
+        const upstreamReferer = proxyUrlParsed.searchParams.get('referer');
+        const upstreamUA = proxyUrlParsed.searchParams.get('userAgent');
+        assert(!!upstreamTarget && upstreamTarget.startsWith('http'), 'Stream proxy URL unwraps to valid upstream HTTP target');
+
+        console.log('  -> Verifying upstream stream fetch with forwarded headers...');
+        const upstreamResp = await fetch(upstreamTarget!, {
+          headers: {
+            'User-Agent': upstreamUA!,
+            Referer: upstreamReferer!,
+          },
+        });
+        assert(upstreamResp.status === 200, `Upstream stream server responds with HTTP 200 (got ${upstreamResp.status})`);
+        const manifestText = await upstreamResp.text();
+        assert(manifestText.startsWith('#EXTM3U'), 'Upstream stream response is valid EXTM3U manifest');
+      }
+
+      // 6. Test Series Episode Stream
+      console.log('  -> Testing Egydead series episode stream resolution (5407:8063)...');
+      const epStreams = await egydead.getStreams('5407', 'series', '5407:8063');
+      assert(epStreams.length > 0, `Egydead episode stream resolution returns playable streams (found ${epStreams.length})`);
+      if (epStreams.length > 0) {
+        const s = epStreams[0];
+        assert(s.url.includes('/api/stream-proxy'), 'Egydead episode stream URL is routed through /api/stream-proxy');
+        assert(!!s.headers && !!s.headers.Referer, 'Egydead episode stream contains Referer header');
+      }
+    } catch (err) {
+      assert(false, `Egydead test suite encountered error: ${(err as Error).message}`);
+    }
+  }
+
+  console.log(`\n--- TEST SUMMARY: ${passed} PASSED, ${failed} FAILED ---`);
+  return { passed, failed };
+}

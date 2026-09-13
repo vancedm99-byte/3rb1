@@ -1,0 +1,6 @@
+{
+  "name": "Re-3arabi Stremio Addon",
+  "description": "Multi-provider Arabic streaming and Live TV addon for Stremio, featuring Akwam, FaselHD, Arabseed, WeCima, Anime4up, WitAnime, 3isk, Egydead, SyriaLive, and YacineTV.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
