@@ -57,7 +57,15 @@ export class EgydeadProvider extends BaseProvider {
   supportedTypes: StremioContentType[] = ['movie', 'series'];
 
   // Mirror domains tracked for fallback
-  mirrors: string[] = ['https://egydead.ca', 'https://tv10.egydead.live', 'https://egydead.beer'];
+  mirrors: string[] = [
+    'https://egydead.ca',
+    'https://egydead.live',
+    'https://tv10.egydead.live',
+    'https://egydead.beer',
+  ];
+
+  // In-memory per-mirror health tracking (isolated to Egydead)
+  private mirrorHealth: Map<string, { url: string; lastSuccess: number; lastChallenge: number; consecutiveFailures: number }> = new Map();
 
   // Circuit breaker constants for Cloudflare bot challenge mitigation
   private readonly CONSECUTIVE_CHALLENGE_THRESHOLD = 3;
@@ -114,15 +122,65 @@ export class EgydeadProvider extends BaseProvider {
     this.cooldownUntil = 0;
   }
 
-  private getBrowserHeaders(isApi: boolean = true): Record<string, string> {
+  getOrderedCandidateMirrors(): string[] {
+    return [...this.mirrors].sort((a, b) => {
+      const cleanA = a.replace(/\/+$/, '');
+      const cleanB = b.replace(/\/+$/, '');
+      const ha = this.mirrorHealth.get(cleanA) || { url: cleanA, lastSuccess: 0, lastChallenge: 0, consecutiveFailures: 0 };
+      const hb = this.mirrorHealth.get(cleanB) || { url: cleanB, lastSuccess: 0, lastChallenge: 0, consecutiveFailures: 0 };
+
+      const aChallenged = ha.lastChallenge > ha.lastSuccess && ha.lastChallenge > 0;
+      const bChallenged = hb.lastChallenge > hb.lastSuccess && hb.lastChallenge > 0;
+
+      // Unchallenged mirrors always precede challenged ones
+      if (!aChallenged && bChallenged) return -1;
+      if (aChallenged && !bChallenged) return 1;
+
+      // Prefer the most recently healthy mirror
+      if (ha.lastSuccess !== hb.lastSuccess) {
+        return hb.lastSuccess - ha.lastSuccess;
+      }
+
+      // Prefer mirror with fewer consecutive failures
+      if (ha.consecutiveFailures !== hb.consecutiveFailures) {
+        return ha.consecutiveFailures - hb.consecutiveFailures;
+      }
+
+      return this.mirrors.indexOf(a) - this.mirrors.indexOf(b);
+    });
+  }
+
+  recordMirrorSuccess(mirrorUrl: string): void {
+    const clean = mirrorUrl.replace(/\/+$/, '');
+    const h = this.mirrorHealth.get(clean) || { url: clean, lastSuccess: 0, lastChallenge: 0, consecutiveFailures: 0 };
+    h.lastSuccess = Date.now();
+    h.consecutiveFailures = 0;
+    this.mirrorHealth.set(clean, h);
+  }
+
+  recordMirrorChallenge(mirrorUrl: string): void {
+    const clean = mirrorUrl.replace(/\/+$/, '');
+    const h = this.mirrorHealth.get(clean) || { url: clean, lastSuccess: 0, lastChallenge: 0, consecutiveFailures: 0 };
+    h.lastChallenge = Date.now();
+    h.consecutiveFailures++;
+    this.mirrorHealth.set(clean, h);
+  }
+
+  getMirrorHealth(mirrorUrl: string) {
+    const clean = mirrorUrl.replace(/\/+$/, '');
+    return this.mirrorHealth.get(clean) || { url: clean, lastSuccess: 0, lastChallenge: 0, consecutiveFailures: 0 };
+  }
+
+  private getBrowserHeaders(isApi: boolean = true, mirrorUrl?: string): Record<string, string> {
+    const origin = (mirrorUrl || this.mainUrl).replace(/\/+$/, '');
     return {
       'User-Agent': DEFAULT_USER_AGENT,
       'Accept': isApi
         ? 'application/json, text/plain, */*'
         : 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
       'Accept-Language': 'ar,en-US;q=0.9,en;q=0.8',
-      'Referer': `${this.mainUrl}/`,
-      'Origin': this.mainUrl,
+      'Referer': `${origin}/`,
+      'Origin': origin,
       'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
       'sec-ch-ua-mobile': '?0',
       'sec-ch-ua-platform': '"Windows"',
@@ -134,48 +192,92 @@ export class EgydeadProvider extends BaseProvider {
   }
 
   private async requestWithRetry(
-    url: string,
+    urlOrPath: string,
     options: { isApi?: boolean; timeout?: number; maxRetries?: number } = {}
   ): Promise<HttpResponse<any>> {
     const isApi = options.isApi ?? true;
     const timeout = options.timeout ?? 8000;
     const maxRetries = options.maxRetries ?? 1;
 
-    let lastResp: HttpResponse<any> | null = null;
-
-    for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
-      const headers = this.getBrowserHeaders(isApi);
-      if (attempt > 1) {
-        headers['Cache-Control'] = 'no-cache';
-      }
-
+    let pathAndQuery: string;
+    if (urlOrPath.startsWith('http://') || urlOrPath.startsWith('https://')) {
       try {
-        const resp = await http.get(url, { headers, timeout });
-        lastResp = resp;
-
-        if (!isCaptchaChallenge(resp.text, resp.status)) {
-          this.recordSuccess();
-          return resp;
-        }
-
-        if (attempt <= maxRetries) {
-          this.logger.debug(
-            `Egydead request to ${url} returned Cloudflare challenge (attempt ${attempt}/${maxRetries + 1}); retrying with 1.5s backoff...`
-          );
-          await new Promise((r) => setTimeout(r, 1500));
-        }
-      } catch (err) {
-        this.logger.debug(`Egydead request error on attempt ${attempt} for ${url}: ${(err as Error).message}`);
-        if (attempt > maxRetries) throw err;
-        await new Promise((r) => setTimeout(r, 1500));
+        const parsed = new URL(urlOrPath);
+        pathAndQuery = `${parsed.pathname}${parsed.search}`;
+      } catch {
+        pathAndQuery = urlOrPath.startsWith('/') ? urlOrPath : `/${urlOrPath}`;
       }
+    } else {
+      pathAndQuery = urlOrPath.startsWith('/') ? urlOrPath : `/${urlOrPath}`;
     }
 
-    if (lastResp && isCaptchaChallenge(lastResp.text, lastResp.status)) {
+    const candidateMirrors = this.getOrderedCandidateMirrors();
+    let lastResp: HttpResponse<any> | null = null;
+    let lastError: Error | null = null;
+    let challengedMirrorsCount = 0;
+
+    for (const mirror of candidateMirrors) {
+      const cleanMirror = mirror.replace(/\/+$/, '');
+      const fullUrl = `${cleanMirror}${pathAndQuery}`;
+
+      for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+        const headers = this.getBrowserHeaders(isApi, cleanMirror);
+        if (attempt > 1) {
+          headers['Cache-Control'] = 'no-cache';
+        }
+
+        try {
+          const resp = await http.get(fullUrl, { headers, timeout });
+          lastResp = resp;
+
+          if (!isCaptchaChallenge(resp.text, resp.status)) {
+            // Mirror answered cleanly without Cloudflare challenge
+            this.recordMirrorSuccess(cleanMirror);
+            this.mainUrl = cleanMirror;
+            this.recordSuccess();
+            this.logger.debug(
+              `[Egydead] Request to ${pathAndQuery} successfully served by mirror ${cleanMirror}`
+            );
+            return resp;
+          }
+
+          if (attempt <= maxRetries) {
+            this.logger.debug(
+              `[Egydead] Mirror ${cleanMirror} challenge (attempt ${attempt}/${maxRetries + 1}) for ${pathAndQuery}; retrying with backoff...`
+            );
+            await new Promise((r) => setTimeout(r, 1000));
+          }
+        } catch (err) {
+          lastError = err as Error;
+          this.logger.debug(
+            `[Egydead] Mirror ${cleanMirror} error on attempt ${attempt} for ${pathAndQuery}: ${(err as Error).message}`
+          );
+          if (attempt <= maxRetries) {
+            await new Promise((r) => setTimeout(r, 1000));
+          }
+        }
+      }
+
+      // This candidate mirror failed or was challenged across attempts; record and rotate
+      challengedMirrorsCount++;
+      this.recordMirrorChallenge(cleanMirror);
+      this.logger.debug(
+        `[Egydead] Mirror ${cleanMirror} challenged/failed for ${pathAndQuery}; rotating to next candidate mirror (${challengedMirrorsCount}/${candidateMirrors.length})...`
+      );
+    }
+
+    // Only trip circuit breaker if ALL candidate mirrors were challenged/failed in this request cycle
+    if (challengedMirrorsCount >= candidateMirrors.length) {
+      this.logger.warn(
+        `[Egydead] All ${candidateMirrors.length} candidate mirrors were challenged/failed for ${pathAndQuery}; tripping circuit breaker failure.`
+      );
       this.recordChallengeFailure();
     }
 
-    return lastResp!;
+    if (lastResp) {
+      return lastResp;
+    }
+    throw lastError || new Error(`All candidate Egydead mirrors failed for ${pathAndQuery}`);
   }
 
   getCatalogs(): ProviderCatalogDefinition[] {
@@ -205,19 +307,10 @@ export class EgydeadProvider extends BaseProvider {
     return match ? match[1] : input.replace(/[^a-zA-Z0-9_-]/g, '');
   }
 
-  async searchInternal(query: string): Promise<ProviderItem[]> {
-    const cacheKey = `egydead:search:${query.toLowerCase()}`;
-    if (this.isCooldownActive()) {
-      const cached = globalCache.get<ProviderItem[]>(cacheKey);
-      if (cached) return cached;
-      const remainingMin = Math.ceil(this.getCooldownRemainingMs() / 60000);
-      this.logger.debug(`Egydead in Cloudflare cooldown (resuming in ${remainingMin}m); skipping search for "${query}".`);
-      return [];
-    }
-
+  private async fetchSearch(query: string): Promise<ProviderItem[]> {
     try {
       this.logger.debug(`Searching Egydead for query "${query}"`);
-      const url = `${this.mainUrl}/api/v1/search/${encodeURIComponent(query)}`;
+      const url = `/api/v1/search/${encodeURIComponent(query)}`;
       const resp = await this.requestWithRetry(url, {
         isApi: true,
         timeout: 7000,
@@ -226,7 +319,7 @@ export class EgydeadProvider extends BaseProvider {
 
       if (isCaptchaChallenge(resp.text, resp.status)) {
         this.logger.warn(`Egydead search returned captcha challenge for "${query}"`);
-        return globalCache.get<ProviderItem[]>(cacheKey) || [];
+        return [];
       }
 
       if (resp.status === 200 && resp.text.startsWith('{')) {
@@ -245,9 +338,6 @@ export class EgydeadProvider extends BaseProvider {
             url: `${this.mainUrl}/titles/${item.id}`,
           };
         });
-        if (items.length > 0) {
-          globalCache.set(cacheKey, items, 600); // 10m cache
-        }
         return items;
       }
 
@@ -255,32 +345,55 @@ export class EgydeadProvider extends BaseProvider {
       return this.searchHtmlFallback(resp);
     } catch (e) {
       this.logger.debug(`Egydead search error: ${(e as Error).message}`);
-      return globalCache.get<ProviderItem[]>(cacheKey) || [];
+      return [];
     }
   }
 
-  async getCatalogInternal(catalogId: string, page: number = 1, genre?: string): Promise<ProviderItem[]> {
-    const cacheKey = `egydead:catalog:${catalogId}:${page}:${genre || ''}`;
-
+  async searchInternal(query: string): Promise<ProviderItem[]> {
+    const cacheKey = `egydead:search:${query.toLowerCase()}`;
     if (this.isCooldownActive()) {
-      const cached = globalCache.get<ProviderItem[]>(cacheKey);
-      if (cached && cached.length > 0) {
-        this.logger.debug(`Egydead serving ${cached.length} cached items while in Cloudflare cooldown`);
-        return cached;
-      }
+      const cached = globalCache.get<ProviderItem[]>(cacheKey, true);
+      if (cached) return cached;
       const remainingMin = Math.ceil(this.getCooldownRemainingMs() / 60000);
-      this.logger.debug(
-        `Egydead in Cloudflare cooldown (resuming in ${remainingMin}m); skipping outbound request to prevent log spam and IP penalty.`
-      );
+      this.logger.debug(`Egydead in Cloudflare cooldown (resuming in ${remainingMin}m); skipping search for "${query}".`);
       return [];
     }
 
+    return globalCache.getOrRevalidate<ProviderItem[]>(
+      cacheKey,
+      async () => {
+        try {
+          const items = await this.fetchSearch(query);
+          if (items.length === 0) {
+            const stale = globalCache.get<ProviderItem[]>(cacheKey, true);
+            if (stale && stale.length > 0) return stale;
+          }
+          return items;
+        } catch (err) {
+          const stale = globalCache.get<ProviderItem[]>(cacheKey, true);
+          if (stale && stale.length > 0) return stale;
+          throw err;
+        }
+      },
+      {
+        ttlSeconds: 600, // 10m fresh
+        staleTtlSeconds: 1200, // 20m stale window
+        onError: (err) => {
+          this.logger.debug(
+            `Background revalidation failed for search "${query}": ${(err as Error).message}`
+          );
+        },
+      }
+    );
+  }
+
+  private async fetchCatalog(catalogId: string, page: number = 1, genre?: string): Promise<ProviderItem[]> {
     try {
       const isSeries = catalogId === 'series';
       const channelSlug = isSeries ? 'series' : 'movies';
       this.logger.debug(`Fetching Egydead catalog "${catalogId}" page ${page}`);
 
-      const url = `${this.mainUrl}/api/v1/channel/${channelSlug}?page=${page}`;
+      const url = `/api/v1/channel/${channelSlug}?page=${page}`;
       const resp = await this.requestWithRetry(url, {
         isApi: true,
         timeout: 8000,
@@ -289,8 +402,7 @@ export class EgydeadProvider extends BaseProvider {
 
       if (isCaptchaChallenge(resp.text, resp.status)) {
         this.logger.warn(`Egydead catalog "${catalogId}" page ${page} returned Cloudflare challenge`);
-        const cached = globalCache.get<ProviderItem[]>(cacheKey);
-        return cached || [];
+        return [];
       }
 
       if (resp.status === 200 && resp.text.startsWith('{')) {
@@ -334,9 +446,6 @@ export class EgydeadProvider extends BaseProvider {
           };
         });
 
-        if (items.length > 0) {
-          globalCache.set(cacheKey, items, 1800); // 30m cache
-        }
         return items;
       }
 
@@ -344,26 +453,60 @@ export class EgydeadProvider extends BaseProvider {
       return this.catalogHtmlFallback(resp, isSeries);
     } catch (e) {
       this.logger.debug(`Egydead getCatalog error: ${(e as Error).message}`);
-      const cached = globalCache.get<ProviderItem[]>(cacheKey);
-      return cached || [];
+      return [];
     }
   }
 
-  async getMetaInternal(contentId: string, type: StremioContentType | string): Promise<ProviderDetail | null> {
-    const titleId = this.extractNumericId(contentId);
-    const cacheKey = `egydead:meta:${titleId}`;
+  async getCatalogInternal(catalogId: string, page: number = 1, genre?: string): Promise<ProviderItem[]> {
+    const cacheKey = `egydead:catalog:${catalogId}:${page}:${genre || ''}`;
 
     if (this.isCooldownActive()) {
-      const cached = globalCache.get<ProviderDetail>(cacheKey);
-      if (cached) return cached;
-      this.logger.debug(`Egydead in Cloudflare cooldown; skipping meta fetch for ID ${titleId}`);
-      return null;
+      const cached = globalCache.get<ProviderItem[]>(cacheKey, true);
+      if (cached && cached.length > 0) {
+        this.logger.debug(`Egydead serving ${cached.length} stale cached items while in Cloudflare cooldown`);
+        return cached;
+      }
+      const remainingMin = Math.ceil(this.getCooldownRemainingMs() / 60000);
+      this.logger.debug(
+        `Egydead in Cloudflare cooldown (resuming in ${remainingMin}m); skipping outbound request to prevent log spam and IP penalty.`
+      );
+      return [];
     }
 
+    return globalCache.getOrRevalidate<ProviderItem[]>(
+      cacheKey,
+      async () => {
+        try {
+          const items = await this.fetchCatalog(catalogId, page, genre);
+          if (items.length === 0) {
+            const stale = globalCache.get<ProviderItem[]>(cacheKey, true);
+            if (stale && stale.length > 0) return stale;
+          }
+          return items;
+        } catch (err) {
+          const stale = globalCache.get<ProviderItem[]>(cacheKey, true);
+          if (stale && stale.length > 0) return stale;
+          throw err;
+        }
+      },
+      {
+        ttlSeconds: 1800, // 30m fresh
+        staleTtlSeconds: 1800, // 30m stale window (bounded 60m staleness ceiling)
+        onError: (err) => {
+          this.logger.debug(
+            `Background revalidation failed for catalog "${catalogId}" page ${page}: ${(err as Error).message}`
+          );
+        },
+      }
+    );
+  }
+
+  private async fetchMeta(contentId: string, type: StremioContentType | string): Promise<ProviderDetail | null> {
+    const titleId = this.extractNumericId(contentId);
     this.logger.debug(`Fetching Egydead metadata for title ${titleId} (original: ${contentId})`);
 
     try {
-      const url = `${this.mainUrl}/api/v1/titles/${titleId}?loader=titlePage`;
+      const url = `/api/v1/titles/${titleId}?loader=titlePage`;
       const resp = await this.requestWithRetry(url, {
         isApi: true,
         timeout: 8000,
@@ -372,7 +515,7 @@ export class EgydeadProvider extends BaseProvider {
 
       if (isCaptchaChallenge(resp.text, resp.status)) {
         this.logger.warn(`Egydead meta returned Cloudflare challenge for ID ${titleId}`);
-        return globalCache.get<ProviderDetail>(cacheKey);
+        return null;
       }
 
       if (resp.status === 200 && resp.text.startsWith('{')) {
@@ -388,7 +531,7 @@ export class EgydeadProvider extends BaseProvider {
           for (const season of seasons) {
             try {
               const epResp = await this.requestWithRetry(
-                `${this.mainUrl}/api/v1/titles/${titleId}/seasons/${season.number}`,
+                `/api/v1/titles/${titleId}/seasons/${season.number}`,
                 {
                   isApi: true,
                   timeout: 6000,
@@ -400,7 +543,7 @@ export class EgydeadProvider extends BaseProvider {
                 const epList: MtdbEpisode[] = epJson.episodes?.data || epJson.episodes || [];
                 for (const ep of epList) {
                   episodes.push({
-                    id: this.formatId(`${titleId}:${ep.id}`),
+                    id: this.formatId(`${titleId}:${season.number}:${ep.episode_number}:${ep.id}`),
                     title: ep.name || `الحلقة ${ep.episode_number}`,
                     season: ep.season_number || season.number,
                     episode: ep.episode_number || 1,
@@ -428,7 +571,6 @@ export class EgydeadProvider extends BaseProvider {
           episodes: episodes.length > 0 ? episodes : undefined,
         };
 
-        globalCache.set(cacheKey, detail, 3600); // 1h cache
         return detail;
       }
 
@@ -436,8 +578,47 @@ export class EgydeadProvider extends BaseProvider {
       return this.metaHtmlFallback(contentId, type);
     } catch (e) {
       this.logger.debug(`Egydead getMeta error: ${(e as Error).message}`);
-      return globalCache.get<ProviderDetail>(cacheKey);
+      return null;
     }
+  }
+
+  async getMetaInternal(contentId: string, type: StremioContentType | string): Promise<ProviderDetail | null> {
+    const titleId = this.extractNumericId(contentId);
+    const cacheKey = `egydead:meta:${titleId}`;
+
+    if (this.isCooldownActive()) {
+      const cached = globalCache.get<ProviderDetail>(cacheKey, true);
+      if (cached) return cached;
+      this.logger.debug(`Egydead in Cloudflare cooldown; skipping meta fetch for ID ${titleId}`);
+      return null;
+    }
+
+    return globalCache.getOrRevalidate<ProviderDetail | null>(
+      cacheKey,
+      async () => {
+        try {
+          const meta = await this.fetchMeta(contentId, type);
+          if (!meta) {
+            const stale = globalCache.get<ProviderDetail>(cacheKey, true);
+            if (stale) return stale;
+          }
+          return meta;
+        } catch (err) {
+          const stale = globalCache.get<ProviderDetail>(cacheKey, true);
+          if (stale) return stale;
+          throw err;
+        }
+      },
+      {
+        ttlSeconds: 3600, // 60m fresh
+        staleTtlSeconds: 1800, // 30m stale window (bounded 90m staleness ceiling)
+        onError: (err) => {
+          this.logger.debug(
+            `Background revalidation failed for metadata "${contentId}": ${(err as Error).message}`
+          );
+        },
+      }
+    );
   }
 
   async getStreamsInternal(contentId: string, _type: StremioContentType | string, episodeId?: string): Promise<ResolvedStream[]> {
@@ -457,40 +638,128 @@ export class EgydeadProvider extends BaseProvider {
       const serverEmbedUrls: { name: string; src: string }[] = [];
 
       if (episodeId) {
-        // Episode stream resolution
-        const epId = this.extractNumericId(episodeId.split(':').pop() || episodeId);
+        // Episode stream resolution strictly scoped to requested episode
+        const cleanEpId = episodeId.replace(/^egydead:/, '');
+        const epParts = cleanEpId.split(':');
+        let seasonNum: number | undefined;
+        let epNum: number | undefined;
+        let targetEpId: string | undefined;
+        let primaryVideoId: number | string | undefined;
 
-        // 1. Check /api/v1/videos?titleId=X&episodeId=Y
-        try {
-          const epVideosResp = await this.requestWithRetry(
-            `${this.mainUrl}/api/v1/videos?titleId=${titleId}&episodeId=${epId}`,
-            {
-              isApi: true,
-              timeout: 6000,
-              maxRetries: 1,
-            }
-          );
-          if (epVideosResp.status === 200 && epVideosResp.text.startsWith('{')) {
-            const data = JSON.parse(epVideosResp.text);
-            const videos: MtdbVideo[] = data.pagination?.data || [];
-            for (const v of videos) {
-              if (v.src && !serverEmbedUrls.some((s) => s.src === v.src)) {
-                serverEmbedUrls.push({ name: v.name || 'سيرفر الحلقات', src: v.src });
-              }
-            }
+        this.logger.debug(
+          `[Egydead] Episode stream request: rawEpisodeId="${episodeId}", parts=[${epParts.join(', ')}]`
+        );
+
+        if (epParts.length >= 4) {
+          // Format: titleId:seasonNum:epNum:epId
+          seasonNum = Number(epParts[1]);
+          epNum = Number(epParts[2]);
+          targetEpId = epParts[3];
+        } else if (epParts.length === 3) {
+          // Format: titleId:seasonNum:epNum OR seasonNum:epNum:epId
+          if (Number(epParts[1]) < 100 && Number(epParts[2]) < 500) {
+            seasonNum = Number(epParts[1]);
+            epNum = Number(epParts[2]);
+          } else {
+            seasonNum = Number(epParts[0]);
+            epNum = Number(epParts[1]);
+            targetEpId = epParts[2];
           }
-        } catch (err) {
-          this.logger.debug(`Direct episode video lookup error: ${(err as Error).message}`);
+        } else if (epParts.length === 2) {
+          // Format: titleId:epId OR seasonNum:epNum
+          if (Number(epParts[0]) < 50 && Number(epParts[1]) < 500) {
+            seasonNum = Number(epParts[0]);
+            epNum = Number(epParts[1]);
+          } else {
+            targetEpId = epParts[1];
+          }
+        } else if (epParts.length === 1) {
+          targetEpId = epParts[0];
         }
 
-        // 2. Fallback: Lookup video directly by ID /api/v1/videos/:id
-        if (serverEmbedUrls.length === 0 && epId) {
+        // If season and episode numbers are missing, look up via cached metadata or season endpoints
+        if ((!seasonNum || !epNum) && targetEpId) {
+          const cachedMeta = globalCache.get<ProviderDetail>(`egydead:meta:${titleId}`);
+          if (cachedMeta?.episodes) {
+            const found = cachedMeta.episodes.find(
+              (e) =>
+                e.id === episodeId ||
+                e.id === `egydead:${cleanEpId}` ||
+                e.id.endsWith(`:${targetEpId}`) ||
+                e.url.endsWith(`/${targetEpId}`)
+            );
+            if (found) {
+              seasonNum = found.season;
+              epNum = found.episode;
+            }
+          }
+
+          if (!seasonNum || !epNum) {
+            try {
+              const sResp = await this.requestWithRetry(
+                `${this.mainUrl}/api/v1/titles/${titleId}/seasons/1`,
+                { isApi: true, timeout: 6000, maxRetries: 1 }
+              );
+              if (sResp.status === 200 && sResp.text.startsWith('{')) {
+                const sJson = JSON.parse(sResp.text);
+                const matched = (sJson.episodes?.data || []).find(
+                  (e: any) => String(e.id) === String(targetEpId)
+                );
+                if (matched) {
+                  seasonNum = matched.season_number || 1;
+                  epNum = matched.episode_number;
+                  if (matched.primary_video?.id) {
+                    primaryVideoId = matched.primary_video.id;
+                  }
+                }
+              }
+            } catch (err) {
+              this.logger.debug(`Season lookup error for title ${titleId}: ${(err as Error).message}`);
+            }
+          }
+        }
+
+        this.logger.debug(
+          `[Egydead] Episode scoped parameters: titleId=${titleId}, season=${seasonNum || 'unknown'}, episode=${epNum || 'unknown'}, targetEpId=${targetEpId || 'none'}`
+        );
+
+        // 1. Fetch exact episode page: /api/v1/titles/:titleId/seasons/:seasonNum/episodes/:epNum?loader=episodePage
+        if (seasonNum && epNum) {
           try {
-            const directVideoResp = await this.requestWithRetry(`${this.mainUrl}/api/v1/videos/${epId}`, {
+            const epPageUrl = `${this.mainUrl}/api/v1/titles/${titleId}/seasons/${seasonNum}/episodes/${epNum}?loader=episodePage`;
+            const epPageResp = await this.requestWithRetry(epPageUrl, {
               isApi: true,
-              timeout: 6000,
+              timeout: 7000,
               maxRetries: 1,
             });
+
+            if (epPageResp.status === 200 && epPageResp.text.startsWith('{')) {
+              const data = JSON.parse(epPageResp.text);
+              const epVideos: MtdbVideo[] = data.episode?.videos || [];
+              for (const v of epVideos) {
+                // Confirm video belongs to this episode and title without leaking other episodes
+                if (
+                  v.src &&
+                  (!targetEpId || !v.episode_id || String(v.episode_id) === String(targetEpId)) &&
+                  !serverEmbedUrls.some((s) => s.src === v.src)
+                ) {
+                  serverEmbedUrls.push({ name: v.name || 'سيرفر الحلقات', src: v.src });
+                }
+              }
+            }
+          } catch (err) {
+            this.logger.debug(`Episode page lookup error: ${(err as Error).message}`);
+          }
+        }
+
+        // 2. Fallback: Lookup video directly by primaryVideoId or targetEpId /api/v1/videos/:id
+        const fallbackVideoId = primaryVideoId || (targetEpId && /^\d+$/.test(targetEpId) ? targetEpId : undefined);
+        if (serverEmbedUrls.length === 0 && fallbackVideoId) {
+          try {
+            const directVideoResp = await this.requestWithRetry(
+              `${this.mainUrl}/api/v1/videos/${fallbackVideoId}`,
+              { isApi: true, timeout: 6000, maxRetries: 1 }
+            );
             if (directVideoResp.status === 200 && directVideoResp.text.startsWith('{')) {
               const data = JSON.parse(directVideoResp.text);
               if (data.video?.src) {
@@ -498,7 +767,7 @@ export class EgydeadProvider extends BaseProvider {
               }
             }
           } catch (err) {
-            this.logger.debug(`Video endpoint lookup error: ${(err as Error).message}`);
+            this.logger.debug(`Video endpoint lookup error for ID ${fallbackVideoId}: ${(err as Error).message}`);
           }
         }
       } else {
@@ -520,24 +789,47 @@ export class EgydeadProvider extends BaseProvider {
         }
       }
 
-      // Extract streams from gathered embed URLs
+      // Extract streams from gathered embed URLs with dual playback mode (Proxy + Direct)
       for (const embed of serverEmbedUrls) {
         try {
           const extracted = await extractStreams(embed.src, `${this.mainUrl}/`);
           for (const s of extracted) {
-            // Egydead upstream hosts (such as egybestvid.com) protect streams with signed tokens
-            // that are cryptographically bound to the server's public IP and User-Agent.
-            // Direct playback requests from external clients/players result in HTTP 403 Forbidden.
-            // Route through /api/stream-proxy and forward Referer & User-Agent headers.
+            const baseServerName = `Egydead - ${embed.name} (${s.name})`;
             const streamProxyUrl = `/api/stream-proxy?url=${encodeURIComponent(s.url)}&referer=${encodeURIComponent(embed.src)}&userAgent=${encodeURIComponent(DEFAULT_USER_AGENT)}`;
+            const proxyHeaders = {
+              Referer: embed.src,
+              'User-Agent': DEFAULT_USER_AGENT,
+            };
+
+            // 1. Proxied variant for browser/web playback (unchanged delivery)
             streams.push({
-              name: `Egydead - ${embed.name} (${s.name})`,
+              name: `${baseServerName} (Proxy — Browser)`,
+              title: `${baseServerName} [${s.quality || 'Auto'}] (Proxy — Browser)\nRe-3arabi High-Speed Stream`,
               quality: s.quality || 'Auto',
               url: streamProxyUrl,
               isM3u8: s.isM3u8 ?? true,
-              headers: {
-                Referer: embed.src,
-                'User-Agent': DEFAULT_USER_AGENT,
+              headers: proxyHeaders,
+              behaviorHints: {
+                notWebReady: false,
+                proxyHeaders: {
+                  request: proxyHeaders,
+                },
+              },
+            });
+
+            // 2. Direct variant for native players (VLC, MX Player, ExoPlayer)
+            streams.push({
+              name: `${baseServerName} (Direct — VLC/External Player)`,
+              title: `${baseServerName} [${s.quality || 'Auto'}] (Direct — VLC/External Player)\nRe-3arabi Direct Stream`,
+              quality: s.quality || 'Auto',
+              url: s.url,
+              isM3u8: s.isM3u8 ?? true,
+              headers: proxyHeaders,
+              behaviorHints: {
+                notWebReady: false,
+                proxyHeaders: {
+                  request: proxyHeaders,
+                },
               },
             });
           }
@@ -547,12 +839,45 @@ export class EgydeadProvider extends BaseProvider {
       }
 
       if (streams.length > 0) {
-        this.logger.info(`Egydead resolved ${streams.length} streams for title ${titleId}`);
+        this.logger.info(`Egydead resolved ${streams.length} stream variants for title ${titleId}`);
         return streams;
       }
 
       // If MTDb yielded no streams, fallback to classic watch-page flow
-      return this.streamsHtmlFallback(contentId, episodeId);
+      const fallbackStreams = await this.streamsHtmlFallback(contentId, episodeId);
+      for (const fs of fallbackStreams) {
+        // Apply dual mode to fallback streams as well
+        const baseName = fs.name;
+        const proxyUrl = `/api/stream-proxy?url=${encodeURIComponent(fs.url)}&referer=${encodeURIComponent(this.mainUrl)}&userAgent=${encodeURIComponent(DEFAULT_USER_AGENT)}`;
+        const headers = fs.headers || { Referer: this.mainUrl, 'User-Agent': DEFAULT_USER_AGENT };
+
+        streams.push({
+          name: `${baseName} (Proxy — Browser)`,
+          title: `${baseName} [${fs.quality || 'Auto'}] (Proxy — Browser)\nRe-3arabi High-Speed Stream`,
+          quality: fs.quality || 'Auto',
+          url: proxyUrl,
+          isM3u8: fs.isM3u8 ?? true,
+          headers,
+          behaviorHints: {
+            notWebReady: false,
+            proxyHeaders: { request: headers },
+          },
+        });
+
+        streams.push({
+          name: `${baseName} (Direct — VLC/External Player)`,
+          title: `${baseName} [${fs.quality || 'Auto'}] (Direct — VLC/External Player)\nRe-3arabi Direct Stream`,
+          quality: fs.quality || 'Auto',
+          url: fs.url,
+          isM3u8: fs.isM3u8 ?? true,
+          headers,
+          behaviorHints: {
+            notWebReady: false,
+            proxyHeaders: { request: headers },
+          },
+        });
+      }
+      return streams;
     } catch (e) {
       this.logger.warn(`Egydead stream resolution encountered error: ${(e as Error).message}`);
       return [];

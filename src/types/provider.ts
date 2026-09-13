@@ -29,10 +29,19 @@ export interface ProviderDetail extends ProviderItem {
 
 export interface ResolvedStream {
   name: string; // Server / Provider name (e.g. "FaselHD - Server 1")
+  title?: string; // Display title / subtitle in Stremio stream list
   quality?: string; // e.g. "1080p", "720p", "Auto"
   url: string;
   headers?: Record<string, string>;
   isM3u8?: boolean;
+  behaviorHints?: {
+    notWebReady?: boolean;
+    bingeGroup?: string;
+    proxyHeaders?: {
+      request?: Record<string, string>;
+      response?: Record<string, string>;
+    };
+  };
 }
 
 export interface ProviderCatalogDefinition {

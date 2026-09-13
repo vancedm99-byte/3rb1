@@ -38,7 +38,10 @@ export const BROWSER_HEADERS: Record<string, string> = {
 
 export class HttpClient {
   private defaultHeaders: Record<string, string>;
-  private cookieJar: Map<string, string> = new Map();
+  // Domain-isolated cookie jar: Map<domain, Map<cookieName, cookieValue>>
+  private domainCookies: Map<string, Map<string, string>> = new Map();
+  // Optional global cookies (for callers using setCookie without hostname)
+  private globalCookies: Map<string, string> = new Map();
 
   constructor(defaultHeaders: Record<string, string> = {}) {
     this.defaultHeaders = {
@@ -49,22 +52,127 @@ export class HttpClient {
     };
   }
 
-  setCookie(key: string, value: string) {
-    this.cookieJar.set(key, value);
+  setCookie(keyOrRawHeader: string, valueOrHost?: string, hostnameOrUrl?: string) {
+    let key = keyOrRawHeader;
+    let val = valueOrHost || '';
+    let host = hostnameOrUrl;
+
+    // Handle 2-argument signature forms:
+    if (hostnameOrUrl === undefined) {
+      if (keyOrRawHeader.includes('=') && valueOrHost && (valueOrHost.includes('://') || valueOrHost.includes('.'))) {
+        // Form: setCookie('foo=bar; Path=/', 'https://example.com')
+        const parts = keyOrRawHeader.split(';');
+        const first = parts[0]?.trim();
+        const eqIdx = first.indexOf('=');
+        if (eqIdx > 0) {
+          key = first.substring(0, eqIdx).trim();
+          val = first.substring(eqIdx + 1).trim();
+        }
+        host = valueOrHost;
+      } else if (valueOrHost && valueOrHost.includes('=') && (keyOrRawHeader.includes('://') || keyOrRawHeader.includes('.'))) {
+        // Form: setCookie('https://example.com', 'foo=bar; Path=/')
+        host = keyOrRawHeader;
+        const parts = valueOrHost.split(';');
+        const first = parts[0]?.trim();
+        const eqIdx = first.indexOf('=');
+        if (eqIdx > 0) {
+          key = first.substring(0, eqIdx).trim();
+          val = first.substring(eqIdx + 1).trim();
+        }
+      }
+    }
+
+    if (host) {
+      let hostStr = host;
+      if (host.includes('://')) {
+        try {
+          hostStr = new URL(host).hostname;
+        } catch {}
+      }
+      hostStr = hostStr.toLowerCase().replace(/^\./, '');
+      let hostMap = this.domainCookies.get(hostStr);
+      if (!hostMap) {
+        hostMap = new Map();
+        this.domainCookies.set(hostStr, hostMap);
+      }
+      hostMap.set(key, val);
+    } else {
+      this.globalCookies.set(key, val);
+    }
   }
 
-  getCookieString(): string {
+  getCookieString(targetUrlOrHostname?: string): string {
     const parts: string[] = [];
-    this.cookieJar.forEach((val, key) => {
-      parts.push(`${key}=${val}`);
+    const seenKeys = new Set<string>();
+
+    if (targetUrlOrHostname) {
+      let host = targetUrlOrHostname;
+      if (targetUrlOrHostname.includes('://')) {
+        try {
+          host = new URL(targetUrlOrHostname).hostname;
+        } catch {}
+      }
+      host = host.toLowerCase();
+
+      // Match exact host or parent domains
+      for (const [domain, cookies] of this.domainCookies.entries()) {
+        if (host === domain || host.endsWith('.' + domain)) {
+          cookies.forEach((val, key) => {
+            if (!seenKeys.has(key)) {
+              seenKeys.add(key);
+              parts.push(`${key}=${val}`);
+            }
+          });
+        }
+      }
+    } else {
+      // If no host specified, collect all domain cookies
+      for (const cookies of this.domainCookies.values()) {
+        cookies.forEach((val, key) => {
+          if (!seenKeys.has(key)) {
+            seenKeys.add(key);
+            parts.push(`${key}=${val}`);
+          }
+        });
+      }
+    }
+
+    // Append global cookies
+    this.globalCookies.forEach((val, key) => {
+      if (!seenKeys.has(key)) {
+        seenKeys.add(key);
+        parts.push(`${key}=${val}`);
+      }
     });
+
     return parts.join('; ');
+  }
+
+  clearCookies(hostnameOrUrl?: string): void {
+    if (hostnameOrUrl) {
+      let host = hostnameOrUrl;
+      if (hostnameOrUrl.includes('://')) {
+        try {
+          host = new URL(hostnameOrUrl).hostname;
+        } catch {}
+      }
+      host = host.toLowerCase().replace(/^\./, '');
+      this.domainCookies.delete(host);
+    } else {
+      this.domainCookies.clear();
+      this.globalCookies.clear();
+    }
   }
 
   async request<T = any>(url: string, options: HttpRequestOptions = {}): Promise<HttpResponse<T>> {
     const controller = new AbortController();
     const timeout = options.timeout || 15000;
     const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+    let reqHostname = '';
+    try {
+      reqHostname = new URL(url).hostname.toLowerCase();
+    } catch {}
 
     const headers: Record<string, string> = {
       ...this.defaultHeaders,
@@ -82,7 +190,7 @@ export class HttpClient {
       headers['Referer'] = options.referer;
     }
 
-    const cookieHeader = [this.getCookieString(), options.cookies].filter(Boolean).join('; ');
+    const cookieHeader = [this.getCookieString(reqHostname), options.cookies].filter(Boolean).join('; ');
     if (cookieHeader) {
       headers['Cookie'] = cookieHeader;
     }
@@ -133,8 +241,18 @@ export class HttpClient {
           if (eqIdx > 0) {
             const k = first.substring(0, eqIdx).trim();
             const v = first.substring(eqIdx + 1).trim();
-            if (k && v && !['path', 'expires', 'domain', 'samesite', 'secure', 'httponly'].includes(k.toLowerCase())) {
-              this.cookieJar.set(k, v);
+            if (k && v && !['path', 'expires', 'domain', 'samesite', 'secure', 'httponly', 'max-age'].includes(k.toLowerCase())) {
+              let cookieDomain = reqHostname;
+              for (let i = 1; i < parts.length; i++) {
+                const attr = parts[i].trim();
+                if (attr.toLowerCase().startsWith('domain=')) {
+                  const rawDomain = attr.substring(7).trim().toLowerCase().replace(/^\./, '');
+                  if (rawDomain) {
+                    cookieDomain = rawDomain;
+                  }
+                }
+              }
+              this.setCookie(k, v, cookieDomain);
             }
           }
         }

@@ -182,11 +182,13 @@ stremioRouter.get('/stream/:type/:id.json', async (req: Request, res: Response) 
       // Build stream object with behaviorHints and proxy headers if needed
       const streamObj: StremioStream = {
         name: s.name,
-        title: `${s.name} ${s.quality ? `[${s.quality}]` : ''}\nRe-3arabi High-Speed Stream`,
+        title: s.title || `${s.name} ${s.quality ? `[${s.quality}]` : ''}\nRe-3arabi High-Speed Stream`,
         url: finalUrl,
       };
 
-      if (s.headers && Object.keys(s.headers).length > 0) {
+      if (s.behaviorHints) {
+        streamObj.behaviorHints = s.behaviorHints;
+      } else if (s.headers && Object.keys(s.headers).length > 0) {
         streamObj.behaviorHints = {
           notWebReady: false,
           proxyHeaders: {

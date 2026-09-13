@@ -307,15 +307,50 @@ export async function runTests() {
         assert(manifestText.startsWith('#EXTM3U'), 'Upstream stream response is valid EXTM3U manifest');
       }
 
-      // 6. Test Series Episode Stream
-      console.log('  -> Testing Egydead series episode stream resolution (5407:8063)...');
-      const epStreams = await egydead.getStreams('5407', 'series', '5407:8063');
-      assert(epStreams.length > 0, `Egydead episode stream resolution returns playable streams (found ${epStreams.length})`);
-      if (epStreams.length > 0) {
-        const s = epStreams[0];
-        assert(s.url.includes('/api/stream-proxy'), 'Egydead episode stream URL is routed through /api/stream-proxy');
-        assert(!!s.headers && !!s.headers.Referer, 'Egydead episode stream contains Referer header');
-      }
+      // 6. Test Series Episode Stream Scope Isolation & Dual Playback Mode
+      console.log('  -> Testing Egydead episode scope isolation (3 episode IDs across 2 series)...');
+      
+      // Series 1: Episode 1 (5407:8063)
+      const ep1Streams = await egydead.getStreams('5407', 'series', '5407:8063');
+      assert(ep1Streams.length > 0, `Egydead series 5407 ep 1 returns streams (found ${ep1Streams.length})`);
+      
+      // Series 1: Episode 2 (5407:8064)
+      const ep2Streams = await egydead.getStreams('5407', 'series', '5407:8064');
+      assert(ep2Streams.length > 0, `Egydead series 5407 ep 2 returns streams (found ${ep2Streams.length})`);
+
+      // Series 2: Episode 1 (5280:7877)
+      const ep5280Streams = await egydead.getStreams('5280', 'series', '5280:7877');
+      assert(ep5280Streams.length > 0, `Egydead series 5280 ep 1 returns streams (found ${ep5280Streams.length})`);
+
+      // Verify no cross-episode stream leak: episode 1 and episode 2 must resolve to different URLs
+      const ep1DirectUrls = ep1Streams.filter(s => s.name.includes('(Direct')).map(s => s.url);
+      const ep2DirectUrls = ep2Streams.filter(s => s.name.includes('(Direct')).map(s => s.url);
+      assert(ep1DirectUrls.length > 0, 'Episode 1 has direct stream variant');
+      assert(ep2DirectUrls.length > 0, 'Episode 2 has direct stream variant');
+      assert(ep1DirectUrls[0] !== ep2DirectUrls[0], 'Episode 1 and Episode 2 stream URLs are distinct (no scope leak)');
+
+      // Verify Dual Playback Mode: every source emits both Proxy and Direct variants
+      const proxyVariants = ep1Streams.filter(s => s.name.includes('(Proxy — Browser)'));
+      const directVariants = ep1Streams.filter(s => s.name.includes('(Direct — VLC/External Player)'));
+      assert(proxyVariants.length > 0, `At least 1 Proxy variant emitted (found ${proxyVariants.length})`);
+      assert(directVariants.length > 0, `At least 1 Direct variant emitted (found ${directVariants.length})`);
+      assert(proxyVariants.length === directVariants.length, 'Exact 1:1 parity between Proxy and Direct variants');
+
+      // Verify Proxy variant characteristics
+      const proxySample = proxyVariants[0];
+      assert(proxySample.url.includes('/api/stream-proxy'), 'Proxy variant routes through /api/stream-proxy');
+      assert(!!proxySample.headers?.Referer, 'Proxy variant has Referer header');
+      assert(!!proxySample.headers?.['User-Agent'], 'Proxy variant has User-Agent header');
+      assert(!!proxySample.behaviorHints?.proxyHeaders?.request?.Referer, 'Proxy variant has behaviorHints proxyHeaders.request.Referer');
+
+      // Verify Direct variant characteristics
+      const directSample = directVariants[0];
+      assert(!directSample.url.includes('/api/stream-proxy'), 'Direct variant does NOT route through /api/stream-proxy');
+      assert(directSample.url.startsWith('http'), 'Direct variant has raw upstream URL');
+      assert(!!directSample.headers?.Referer, 'Direct variant has Referer header');
+      assert(!!directSample.headers?.['User-Agent'], 'Direct variant has User-Agent header');
+      assert(!!directSample.behaviorHints?.proxyHeaders?.request?.Referer, 'Direct variant has behaviorHints proxyHeaders.request.Referer');
+      assert(!!directSample.behaviorHints?.proxyHeaders?.request?.['User-Agent'], 'Direct variant has behaviorHints proxyHeaders.request.User-Agent');
 
       // 7. Test Suite 11: Cloudflare Challenge Mitigation & Circuit Breaker Cooldown
       console.log('\n[Test Suite 11: Egydead Cloudflare Challenge Mitigation & Circuit Breaker Cooldown]');
@@ -363,6 +398,71 @@ export async function runTests() {
       egyAny.recordSuccess();
       assert(egyAny.isDegraded() === false, 'Successful probe resets degraded status back to false');
       assert(egyAny.getCooldownRemainingMs() === 0, 'Cooldown timer reset to 0');
+
+      // 8. Test Suite 12: Mirror Rotation, Cookie Isolation & Stale-While-Revalidate Resilience
+      console.log('\n[Test Suite 12: Mirror Failover, Cookie Isolation & Cache Resilience]');
+
+      // A. Cookie Isolation per hostname
+      http.setCookie('https://egydead.ca/test', 'sess_ca=12345; Path=/');
+      http.setCookie('https://egydead.beer/test', 'sess_beer=67890; Path=/');
+      const caCookies = http.getCookieString('https://egydead.ca/page');
+      const beerCookies = http.getCookieString('https://egydead.beer/page');
+      assert(caCookies.includes('sess_ca=12345'), 'Cookie sess_ca sent to egydead.ca');
+      assert(!caCookies.includes('sess_beer=67890'), 'Cookie sess_beer NOT leaked to egydead.ca');
+      assert(beerCookies.includes('sess_beer=67890'), 'Cookie sess_beer sent to egydead.beer');
+      assert(!beerCookies.includes('sess_ca=12345'), 'Cookie sess_ca NOT leaked to egydead.beer');
+
+      // B. Mirror List Configuration & Health Tracking
+      assert(Array.isArray(egyAny.mirrors) && egyAny.mirrors.length >= 3, 'Egydead has array of candidate mirrors configured');
+      const initialMirrors = egyAny.getOrderedCandidateMirrors();
+      assert(initialMirrors[0] === 'https://egydead.ca', 'First candidate mirror is primary domain');
+
+      // Simulate challenge on primary mirror
+      egyAny.recordMirrorChallenge('https://egydead.ca');
+      const healthCa = egyAny.getMirrorHealth('https://egydead.ca');
+      assert(healthCa.consecutiveFailures === 1, 'egydead.ca recorded 1 challenge failure');
+
+      // Mirror order must demote challenged domain below unchallenged domains
+      const rotatedMirrors = egyAny.getOrderedCandidateMirrors();
+      assert(rotatedMirrors[0] !== 'https://egydead.ca', 'Challenged egydead.ca is rotated out of first position');
+      assert(rotatedMirrors[rotatedMirrors.length - 1] === 'https://egydead.ca', 'Challenged domain moved to bottom of candidate mirrors');
+
+      // Simulate success on tv10.egydead.live mirror
+      egyAny.recordMirrorSuccess('https://tv10.egydead.live');
+      const promotedMirrors = egyAny.getOrderedCandidateMirrors();
+      assert(promotedMirrors[0] === 'https://tv10.egydead.live', 'Healthy mirror promoted to first position');
+
+      // C. Stale-While-Revalidate in MemoryCache
+      const testCache = new MemoryCache();
+      testCache.set('test:swr', { version: 1 }, 1, 10); // 1s fresh, 10s stale
+      const immediateFresh = await testCache.getOrRevalidate('test:swr', async () => ({ version: 2 }), { ttlSeconds: 1 });
+      assert(immediateFresh.version === 1, 'Immediate fresh cache returns original value without revalidation');
+
+      // Wait for fresh TTL to expire into stale window
+      await new Promise((r) => setTimeout(r, 1100));
+      assert(testCache.isStale('test:swr') === true, 'Cache entry entered stale window (isStale = true)');
+
+      let revalidatedValue = 0;
+      const staleServed = await testCache.getOrRevalidate(
+        'test:swr',
+        async () => {
+          await new Promise((r) => setTimeout(r, 100));
+          revalidatedValue = 2;
+          return { version: 2 };
+        },
+        { ttlSeconds: 5, staleTtlSeconds: 10 }
+      );
+      assert(staleServed.version === 1, 'Stale-While-Revalidate returned stale value immediately (version 1)');
+
+      // Allow background revalidation to finish
+      await new Promise((r) => setTimeout(r, 150));
+      assert(revalidatedValue === 2, 'Background revalidation executed asynchronously');
+      const updatedCache = testCache.get<{ version: number }>('test:swr');
+      assert(updatedCache?.version === 2, 'Cache was asynchronously updated with fresh value');
+
+      // Clean up provider health state
+      egyAny.recordMirrorSuccess('https://egydead.ca');
+      egyAny.resetCooldown();
     } catch (err) {
       assert(false, `Egydead test suite encountered error: ${(err as Error).message}`);
     }
