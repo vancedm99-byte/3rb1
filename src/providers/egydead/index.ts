@@ -5,7 +5,7 @@ import { http, HttpResponse, DEFAULT_USER_AGENT, MOBILE_USER_AGENT } from '../..
 import { extractStreams } from '../../extractors/index.js';
 import { isCaptchaChallenge } from '../../utils/captcha.js';
 import { globalCache } from '../../utils/cache.js';
-import { getOrSolveClearance } from '../../utils/cloudflareSolver.js';
+import { getOrSolveClearance, isSolverDegraded } from '../../utils/cloudflareSolver.js';
 
 interface MtdbVideo {
   id: number;
@@ -56,6 +56,7 @@ export class EgydeadProvider extends BaseProvider {
   lang = 'ar';
   mainUrl = 'https://egydead.ca';
   supportedTypes: StremioContentType[] = ['movie', 'series'];
+  requiresBrowserSolver: boolean = false;
 
   // Mirror domains tracked for fallback
   mirrors: string[] = [
@@ -80,6 +81,9 @@ export class EgydeadProvider extends BaseProvider {
   }
 
   isDegraded(): boolean {
+    if (this.requiresBrowserSolver && isSolverDegraded()) {
+      return true;
+    }
     return Date.now() < this.cooldownUntil;
   }
 
@@ -242,13 +246,13 @@ export class EgydeadProvider extends BaseProvider {
             return resp;
           }
 
-          // Try solving the Cloudflare challenge with a headless browser
-          // once per mirror (first attempt only) before falling back to the
-          // normal backoff-retry / mirror-rotation path. Skipped entirely
-          // while already in cooldown so we never launch Chromium during a
-          // known-bad window.
-          if (attempt === 1 && !this.isCooldownActive()) {
-            const clearance = await getOrSolveClearance(fullUrl);
+          // Try solving the Cloudflare challenge with a headless browser ONLY if this provider
+          // explicitly declared a browser solver dependency (requiresBrowserSolver: true).
+          // Egydead operates on the MTDb REST API on egydead.ca without Turnstile, so requiresBrowserSolver
+          // is false; this prevents silent fall-through to CloudflareSolver and avoids tripping circuit
+          // breakers on environments lacking Chromium (e.g. Render native Node).
+          if (this.requiresBrowserSolver && attempt === 1 && !this.isCooldownActive()) {
+            const clearance = await getOrSolveClearance(fullUrl, this.id);
             if (clearance) {
               try {
                 const retryHeaders = {

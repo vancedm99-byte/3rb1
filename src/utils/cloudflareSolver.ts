@@ -66,11 +66,72 @@ async function resolveExecutablePath(): Promise<string | undefined> {
 let chromiumUnavailable = false; // once true, stays true for process lifetime
 let inFlight: Promise<ClearancePair | null> | null = null;
 
+// Registry of providers that explicitly declare requiresBrowserSolver: true.
+// CloudflareSolver must not be an ambient, silent capability that arbitrary providers accidentally fall into.
+const dependentProviders = new Set<string>();
+
+export function registerBrowserSolverDependency(providerId: string): void {
+  dependentProviders.add(providerId);
+}
+
+export function unregisterBrowserSolverDependency(providerId: string): void {
+  dependentProviders.delete(providerId);
+}
+
+export function getDependentProviders(): string[] {
+  return Array.from(dependentProviders);
+}
+
+export function isSolverDegraded(): boolean {
+  return chromiumUnavailable;
+}
+
+export function isSolverAvailable(): boolean {
+  return !chromiumUnavailable;
+}
+
+/**
+ * Permanently disable the browser solver for this process lifetime.
+ * Marks CloudflareSolver and any providers explicitly registered as depending on it as degraded,
+ * and logs a single clear WARN listing which providers are affected.
+ */
+export function disableSolver(reason: string): void {
+  chromiumUnavailable = true;
+  const affected = Array.from(dependentProviders);
+  if (affected.length > 0) {
+    logger.warn(
+      `Chromium unavailable in this environment (${reason}); disabling CloudflareSolver for the rest of this process lifetime. Affected dependent providers marked as degraded: [${affected.join(', ')}].`
+    );
+  } else {
+    logger.warn(
+      `Chromium unavailable in this environment (${reason}); disabling CloudflareSolver for the rest of this process lifetime. No registered providers explicitly declare browser solver dependency (0 affected).`
+    );
+  }
+}
+
+/**
+ * Test utility to reset solver state.
+ */
+export function resetSolverStateForTesting(): void {
+  chromiumUnavailable = false;
+  cachedExecutablePath = null;
+  inFlight = null;
+  dependentProviders.clear();
+}
+
 function cacheKey(hostname: string): string {
   return `cfsolver:clearance:${hostname}`;
 }
 
-export async function getOrSolveClearance(targetUrl: string): Promise<ClearancePair | null> {
+export async function getOrSolveClearance(targetUrl: string, providerId?: string): Promise<ClearancePair | null> {
+  // If providerId is passed, reject calls from providers that did not declare requiresBrowserSolver: true
+  if (providerId && !dependentProviders.has(providerId)) {
+    logger.warn(
+      `Provider "${providerId}" attempted to invoke CloudflareSolver without declaring requiresBrowserSolver: true. Rejecting ambient solver access.`
+    );
+    return null;
+  }
+
   const hostname = new URL(targetUrl).hostname;
 
   const cached = globalCache.get<ClearancePair>(cacheKey(hostname));
@@ -165,10 +226,7 @@ async function solveOnce(targetUrl: string, hostname: string): Promise<Clearance
     return pair;
   } catch (err) {
     if (isLaunchFailure(err)) {
-      chromiumUnavailable = true;
-      logger.warn(
-        `Chromium unavailable in this environment (${(err as Error).message}); disabling solver for the rest of this process lifetime.`
-      );
+      disableSolver((err as Error).message);
     } else {
       logger.warn(`Challenge solve failed for ${hostname}: ${(err as Error).message}`);
     }

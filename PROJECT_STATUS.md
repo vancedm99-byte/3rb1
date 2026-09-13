@@ -259,11 +259,28 @@ All target code is written in modern TypeScript (ESM) with Node.js and React:
   - **Browser Preview Player HLS Engine:** Integrated `hls.js` in `src/components/StreamModal.tsx` to enable seamless in-browser playback of HLS proxy streams within the AI Studio dashboard.
   - **Full Regression Verification:** Added comprehensive regression tests in `src/tests/addon.test.ts` verifying proxy routing, header forwarding, upstream HTTP 200 responses, and full 3-tier playback (master, variant, TS segment) with 70/70 tests passing.
 
+* **Root Cause Diagnosis (Prompt #8 - Decoupling CloudflareSolver from Egydead Catalog Pipeline & Evidence-Based Health Check):**
+  1. **Evidence-Based Domain Health Probe (Live Status of 4 Mirrors):**
+     - `https://egydead.ca/api/v1/channel/movies?page=1`: **HTTP 200 OK**, Content-Type `application/json`, serving clean JSON with zero Turnstile challenge.
+     - `https://egydead.live/api/v1/channel/movies?page=1`: **HTTP 403 Forbidden**, serving Cloudflare Turnstile challenge page (`Just a moment...`).
+     - `https://tv10.egydead.live/api/v1/channel/movies?page=1`: **HTTP 403 Forbidden**, serving Cloudflare Turnstile challenge page (`Just a moment...`).
+     - `https://egydead.beer/api/v1/channel/movies?page=1`: **HTTP 403 Forbidden**, serving Cloudflare Turnstile challenge page (`Just a moment...`).
+  2. **Unintended Ambient Browser Dependency on Gated Secondary Mirrors:**
+     - `egydead.ca` is healthy and never needed a browser solver. However, when secondary/legacy mirrors returned 403 Turnstile challenges, `requestWithRetry` silently fell through to `getOrSolveClearance()`.
+     - In serverless/container environments like Render's native Node runtime (where OS-level Chromium dependencies are absent), `CloudflareSolver` failed with an executable launch error and permanently disabled itself for the process lifetime (`chromiumUnavailable = true`).
+     - The challenge failures across secondary mirrors then accumulated, tripping Egydead's 10-minute circuit breaker cooldown even though its active API host (`egydead.ca`) was completely healthy.
+  3. **Resolution Implemented:**
+     - **Per-Provider Capability Flag (`requiresBrowserSolver`):** Added `requiresBrowserSolver?: boolean` to `IProvider` (default `false` in `BaseProvider`), explicitly declared as `requiresBrowserSolver: false` in `EgydeadProvider`.
+     - **Ambient Solver Call Elimination:** Guarded `getOrSolveClearance()` in `EgydeadProvider.requestWithRetry()` so non-browser providers never attempt browser challenge solving or fall through to `CloudflareSolver`.
+     - **CloudflareSolver Scoped Degradation & Dependency Registry:** Refactored `src/utils/cloudflareSolver.ts` to maintain an explicit set of registered dependent providers (`registerBrowserSolverDependency`). When a launch failure occurs, the disable event only marks *itself and explicitly dependent providers* as degraded, and logs a single clear WARN listing the affected providers (`Affected dependent providers marked as degraded: [...]` or `0 affected`). Ambient solver calls from unlisted providers are rejected.
+     - **Registry-Level Degraded Handling:** Enhanced `ProviderRegistry` to track degraded status per provider, automatically skipping only providers requiring the browser solver when degraded, preserving full provider isolation and preventing any ripple effect on non-browser providers.
+     - **Full Test Coverage:** Added Test Suite 13 in `src/tests/addon.test.ts` verifying solver state transitions, capability flags, dependency tracking, ambient call rejection, and isolated degradation across 131 passing assertions.
+
 | General Issue / Edge Case | Description | Mitigation / Current Behavior |
 |---|---|---|
 | **Egydead Stream Host IP/UA Binding** | `s1.egybestvid.com` binds tokens to IP and User-Agent; direct playback returns HTTP 403. | Stream URLs are routed through `/api/stream-proxy`; master & variant playlists are rewritten to proxy all segments; headers forwarded to Stremio `behaviorHints.proxyHeaders`. |
 | **Frequent Domain Rotation** | Arabic streaming sites change their TLDs frequently due to DMCA/ISP blocks. | Active domains are tested and updated (e.g., WeCima to `mycima.motorcycles`, Egydead to `egydead.ca`); fallback mirror lists implemented. |
-| **Cloudflare Turnstile (Legacy Egydead Mirrors)** | Legacy mirrors (`tv10.egydead.live`, `egydead.beer`) serve Cloudflare Turnstile challenges. | Operational domain migrated to `https://egydead.ca` MTDb API; captcha detector isolates challenges without crashing the registry. |
+| **Cloudflare Turnstile (Legacy Egydead Mirrors) & Solver Decoupling** | Legacy mirrors (`egydead.live`, `tv10.egydead.live`, `egydead.beer`) serve Cloudflare Turnstile (HTTP 403), while `egydead.ca` is 100% healthy (HTTP 200). Missing Chromium on host would disable `CloudflareSolver`. | `EgydeadProvider` sets `requiresBrowserSolver: false`, decoupling it from `CloudflareSolver`. Browser solver disable events only degrade providers declaring an explicit browser dependency; ambient access is rejected. |
 | **Live Sports Stream Expiration** | YacineTV match streams use short-lived timestamp tokens (`?t=...&e=...`). | Cached streams have a short TTL (3 minutes) to ensure fresh tokens are requested on playback. |
 | **Anime4up / WitAnime Geo-Restrictions** | Some anime servers restrict certain IP ranges or rate-limit automated scrapes. | Fallback user agents and headers are applied; FaselHD serves as a high-reliability anime alternative. |
 

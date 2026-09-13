@@ -5,6 +5,17 @@ import { decryptYacine, decryptWitAnimeEpisodeData, safeBase64Decode } from '../
 import { MemoryCache } from '../utils/cache.js';
 import { extractMiraVd, extractMwdy, extractVidoba, extractUkrcdn } from '../extractors/index.js';
 import { http } from '../utils/http.js';
+import {
+  disableSolver,
+  resetSolverStateForTesting,
+  isSolverDegraded,
+  isSolverAvailable,
+  getDependentProviders,
+  getOrSolveClearance,
+} from '../utils/cloudflareSolver.js';
+import { BaseProvider } from '../providers/base.js';
+import { IProvider } from '../types/provider.js';
+import { StremioContentType } from '../types/stremio.js';
 
 export async function runTests() {
   console.log('--- STARTING STREMIO ADDON TESTS ---');
@@ -466,6 +477,69 @@ export async function runTests() {
     } catch (err) {
       assert(false, `Egydead test suite encountered error: ${(err as Error).message}`);
     }
+  }
+
+  // 13. CloudflareSolver Decoupling & Per-Provider Capability Flags
+  console.log('\n[Test Suite 13: CloudflareSolver Decoupling & Capability Flags]');
+  {
+    const egy = registry.getProvider('egydead');
+    assert(!!egy, 'Egydead provider is registered in registry');
+    assert(egy?.requiresBrowserSolver === false, 'Egydead explicitly declares requiresBrowserSolver: false');
+
+    // Verify initial solver state
+    resetSolverStateForTesting();
+    assert(isSolverAvailable() === true, 'CloudflareSolver is initially available');
+    assert(isSolverDegraded() === false, 'CloudflareSolver is initially not degraded');
+    assert(egy?.isDegraded?.() === false, 'Egydead is not degraded initially');
+
+    // Register a mock browser-dependent provider to test dependency tracking
+    class MockBrowserProvider implements IProvider {
+      id = 'mock-browser-provider';
+      name = 'Mock Browser Provider';
+      lang = 'ar';
+      mainUrl = 'https://example.com';
+      supportedTypes: StremioContentType[] = ['movie'];
+      requiresBrowserSolver = true;
+      isDegraded() { return isSolverDegraded(); }
+      getCatalogs() { return []; }
+      async search() { return []; }
+      async getCatalog() { return []; }
+      async getMeta() { return null; }
+      async getStreams() { return []; }
+    }
+
+    const mockProvider = new MockBrowserProvider();
+    registry.register(mockProvider);
+    assert(mockProvider.requiresBrowserSolver === true, 'Mock provider declares requiresBrowserSolver: true');
+    assert(getDependentProviders().includes('mock-browser-provider'), 'Mock provider registered with CloudflareSolver dependency tracker');
+    assert(!getDependentProviders().includes('egydead'), 'Egydead is NOT in CloudflareSolver dependent providers set');
+
+    // Simulate CloudflareSolver disable event (e.g. missing Chromium binary in Render / serverless)
+    disableSolver("Executable doesn't exist at /root/.cache/ms-playwright/chromium");
+    assert(isSolverDegraded() === true, 'CloudflareSolver is now degraded (disabled for process lifetime)');
+
+    // Verify decoupling: Egydead MUST NOT be marked degraded
+    assert(egy?.isDegraded?.() === false, 'Egydead remains NOT degraded after CloudflareSolver disable event');
+    assert(registry.isProviderDegraded('egydead') === false, 'Registry reports Egydead as NOT degraded');
+
+    // Verify dependent provider IS marked degraded
+    assert(mockProvider.isDegraded() === true, 'Mock browser-dependent provider IS marked degraded when solver disabled');
+    assert(registry.isProviderDegraded('mock-browser-provider') === true, 'Registry reports mock browser provider as degraded');
+
+    // Verify ambient access prevention: non-dependent provider rejected if calling solver directly
+    const ambientSolveResult = await getOrSolveClearance('https://egydead.ca/api/v1', 'egydead');
+    assert(ambientSolveResult === null, 'Ambient solver invocation for non-dependent provider returns null');
+
+    // Verify registry safely skips degraded browser-dependent providers without crashing or stalling
+    const catalogResults = await registry.getProviderCatalog('mock-browser-provider', 'movies', 1);
+    assert(Array.isArray(catalogResults) && catalogResults.length === 0, 'Registry gracefully skips catalog for degraded browser provider');
+
+    const streamResults = await registry.getStreams('mock-browser-provider:123', 'movie');
+    assert(Array.isArray(streamResults) && streamResults.length === 0, 'Registry gracefully skips streams for degraded browser provider');
+
+    // Clean up test state
+    resetSolverStateForTesting();
+    assert(isSolverAvailable() === true, 'CloudflareSolver state cleanly reset after test');
   }
 
   console.log(`\n--- TEST SUMMARY: ${passed} PASSED, ${failed} FAILED ---`);

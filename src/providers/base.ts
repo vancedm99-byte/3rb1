@@ -2,6 +2,7 @@ import { IProvider, ProviderCatalogDefinition, ProviderDetail, ProviderItem, Res
 import { StremioContentType } from '../types/stremio.js';
 import { globalCache } from '../utils/cache.js';
 import { Logger } from '../utils/logger.js';
+import { isSolverDegraded } from '../utils/cloudflareSolver.js';
 
 export abstract class BaseProvider implements IProvider {
   abstract id: string;
@@ -9,11 +10,19 @@ export abstract class BaseProvider implements IProvider {
   abstract lang: string;
   abstract mainUrl: string;
   abstract supportedTypes: StremioContentType[];
+  requiresBrowserSolver: boolean = false;
 
   protected logger!: Logger;
 
   protected initLogger() {
     this.logger = new Logger(this.name);
+  }
+
+  isDegraded(): boolean {
+    if (this.requiresBrowserSolver && isSolverDegraded()) {
+      return true;
+    }
+    return false;
   }
 
   abstract getCatalogs(): ProviderCatalogDefinition[];

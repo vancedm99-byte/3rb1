@@ -11,6 +11,7 @@ import { WitAnimeProvider } from './witanime/index.js';
 import { ThreeIskProvider } from './3isk/index.js';
 import { EgydeadProvider } from './egydead/index.js';
 import { Logger } from '../utils/logger.js';
+import { registerBrowserSolverDependency, isSolverDegraded } from '../utils/cloudflareSolver.js';
 
 const logger = new Logger('ProviderRegistry');
 
@@ -32,6 +33,21 @@ export class ProviderRegistry {
 
   register(provider: IProvider) {
     this.providers.set(provider.id, provider);
+    if (provider.requiresBrowserSolver) {
+      registerBrowserSolverDependency(provider.id);
+    }
+  }
+
+  isProviderDegraded(providerId: string): boolean {
+    const provider = this.getProvider(providerId);
+    if (!provider) return false;
+    if (provider.requiresBrowserSolver && isSolverDegraded()) {
+      return true;
+    }
+    if (typeof provider.isDegraded === 'function') {
+      return provider.isDegraded();
+    }
+    return false;
   }
 
   getProvider(id: string): IProvider | undefined {
@@ -61,6 +77,10 @@ export class ProviderRegistry {
     logger.info(`Searching across all providers for: "${query}"`);
     const promises = this.getAllProviders().map(async (provider) => {
       try {
+        if (provider.requiresBrowserSolver && isSolverDegraded()) {
+          logger.warn(`Skipping search for provider ${provider.name}: browser solver permanently unavailable.`);
+          return [];
+        }
         return await provider.search(query);
       } catch (err) {
         logger.error(`Error in search for provider ${provider.name}: ${(err as Error).message}`);
@@ -76,6 +96,10 @@ export class ProviderRegistry {
     const eligibleProviders = this.getAllProviders().filter((p) => p.supportedTypes.includes(type as any) || p.id === type);
     const promises = (eligibleProviders.length > 0 ? eligibleProviders : this.getAllProviders()).map(async (provider) => {
       try {
+        if (provider.requiresBrowserSolver && isSolverDegraded()) {
+          logger.warn(`Skipping catalog for provider ${provider.name}: browser solver permanently unavailable.`);
+          return [];
+        }
         return await provider.getCatalog(type, page);
       } catch (err) {
         logger.error(`Error in catalog for provider ${provider.name}: ${(err as Error).message}`);
@@ -93,6 +117,10 @@ export class ProviderRegistry {
       logger.warn(`Provider not found for catalog: ${providerId}`);
       return [];
     }
+    if (provider.requiresBrowserSolver && isSolverDegraded()) {
+      logger.warn(`Provider ${provider.name} requires browser solver which is permanently unavailable; skipping catalog request.`);
+      return [];
+    }
     try {
       return await provider.getCatalog(catalogId, page, genre);
     } catch (err) {
@@ -105,6 +133,10 @@ export class ProviderRegistry {
     const { provider, contentId } = this.parseProviderAndId(fullId);
     if (!provider) {
       logger.warn(`No provider found for ID: ${fullId}`);
+      return null;
+    }
+    if (provider.requiresBrowserSolver && isSolverDegraded()) {
+      logger.warn(`Provider ${provider.name} requires browser solver which is permanently unavailable; skipping metadata request.`);
       return null;
     }
 
@@ -120,6 +152,10 @@ export class ProviderRegistry {
     const { provider, contentId } = this.parseProviderAndId(fullId);
     if (!provider) {
       logger.warn(`No provider found for stream ID: ${fullId}`);
+      return [];
+    }
+    if (provider.requiresBrowserSolver && isSolverDegraded()) {
+      logger.warn(`Provider ${provider.name} requires browser solver which is permanently unavailable; skipping stream resolution.`);
       return [];
     }
 

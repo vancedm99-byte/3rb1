@@ -56,7 +56,9 @@ export interface IProvider {
   lang: string;
   mainUrl: string;
   supportedTypes: StremioContentType[];
+  requiresBrowserSolver?: boolean;
 
+  isDegraded?(): boolean;
   getCatalogs(): ProviderCatalogDefinition[];
   search(query: string): Promise<ProviderItem[]>;
   getCatalog(catalogId: string, page?: number, genre?: string): Promise<ProviderItem[]>;
